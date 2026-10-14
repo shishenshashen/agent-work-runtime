@@ -126,6 +126,24 @@ awr --project /absolute/project work complete W-123 \
   --input /absolute/completion.json --expected-revision 10
 ```
 
+The input file maps every current acceptance criterion to registered
+evidence:
+
+```json
+{
+  "version": 1,
+  "source_sha": "full current ledger source SHA",
+  "acceptance": [
+    { "criterion": "exact current acceptance text", "evidence": ["ev-key"] }
+  ]
+}
+```
+
+Each criterion appears exactly once, in the ledger's own wording; every
+`evidence` key must name a registered evidence record whose `locator`
+resolves to a valid completion report. Optional fields: `minimum_level`
+(evidence-level enum) and `required_evidence` (extra bound keys).
+
 ## Recording events and evidence
 
 `event append` writes to the project log:

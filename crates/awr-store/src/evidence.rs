@@ -272,6 +272,7 @@ impl Store {
             locator: draft.locator,
             sha256: draft.sha256.map(|s| s.to_ascii_lowercase()),
             source_sha: draft.source_sha.map(|s| s.to_ascii_lowercase()),
+            section_fingerprint: None,
             command: draft.command,
             scope: draft.scope,
             source_ref: None,

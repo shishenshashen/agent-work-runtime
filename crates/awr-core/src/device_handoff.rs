@@ -77,6 +77,8 @@ pub enum HandoffError {
     TicketOverstated { remaining_ms: i64, ceiling_ms: i64 },
     #[error("handoff ticket has no remaining budget ({remaining_ms}ms)")]
     ClaimExpired { remaining_ms: i64 },
+    #[error("handoff ticket carries no checkpoint payload, so the digest cannot be checked on this device")]
+    CheckpointUnverifiable,
     #[error("handoff record could not be serialised: {0}")]
     Record(String),
 }
@@ -179,6 +181,69 @@ pub fn canonical_ticket_digest(ticket: &HandoffTicket) -> Result<String, Handoff
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Cross-device payload verification (design §3.5, acceptance A11/A12/A14).
+//
+// The receiving device has no row for the sender's checkpoint: the two devices do not share a
+// `.awr/state.db`, and `checkpoints` is keyed by ULIDs that do not intersect. So a ticket that
+// carries only `checkpoint_id` + `checkpoint_digest` cannot be checked at all — trusting the
+// sender's digest would make `CheckpointDrift` vacuously true.
+//
+// What makes the check real is that the payload travels INSIDE the record (see migration 015's
+// `checkpoint_payload_json`) and the receiver re-hashes the bytes it actually holds. The sender's
+// digest is an expectation, never a proof. This module keeps no payload field on `HandoffTicket`
+// so the ticket's canonical digest stays exactly what v1.1 froze; the payload is carried by the
+// record wrapper below and by the store row.
+// ---------------------------------------------------------------------------
+
+/// The full cross-device record: the portable ticket plus the checkpoint bytes it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffRecord {
+    pub ticket: HandoffTicket,
+    /// Canonical checkpoint bytes, exactly as the sender read them. Never re-serialised in transit.
+    pub checkpoint_payload_json: String,
+}
+
+/// Lowercase hex sha256 of exactly the bytes that travelled.
+pub fn payload_digest(payload_bytes: &[u8]) -> String {
+    Sha256::digest(payload_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Receiver-side gate that keeps `CheckpointDrift` reachable across devices (A11/A12).
+///
+/// - no payload / empty payload / malformed expected digest -> [`HandoffError::CheckpointUnverifiable`]
+///   (never `Ok`, and never reported as drift: "cannot check" is not "checked and equal")
+/// - payload whose recomputed digest differs -> [`HandoffError::CheckpointDrift`]
+/// - otherwise -> `Ok(recomputed_digest)`, which the caller must be able to compare byte-for-byte
+///   with the digest it stores next to the materialised payload.
+pub fn verify_payload(
+    payload_bytes: Option<&[u8]>,
+    expected_digest: &str,
+) -> Result<String, HandoffError> {
+    let bytes = match payload_bytes {
+        Some(bytes) if !bytes.is_empty() => bytes,
+        _ => return Err(HandoffError::CheckpointUnverifiable),
+    };
+    let well_formed = expected_digest.len() == 64
+        && expected_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !well_formed {
+        return Err(HandoffError::CheckpointUnverifiable);
+    }
+    let actual = payload_digest(bytes);
+    if actual != expected_digest {
+        return Err(HandoffError::CheckpointDrift {
+            expected: expected_digest.to_string(),
+            got: actual,
+        });
+    }
+    Ok(actual)
 }
 
 // ---------------------------------------------------------------------------

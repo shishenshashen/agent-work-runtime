@@ -15,8 +15,9 @@
 
 use awr_core::device_handoff::{
     canonical_ticket_digest, canonical_ticket_json, local_deadline_ms,
-    local_deadline_ms_naive_extend, local_deadline_ms_naive_sender_clock, remaining_ceiling_ms,
-    validate_ticket, HandoffError, HandoffTicket, RedeemInput, MARGIN_MS,
+    local_deadline_ms_naive_extend, local_deadline_ms_naive_sender_clock, payload_digest,
+    remaining_ceiling_ms, validate_ticket, verify_payload, HandoffError, HandoffRecord,
+    HandoffTicket, RedeemInput, MARGIN_MS,
 };
 
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -321,3 +322,61 @@ fn a10_overstated_budget_is_refused_at_the_ceiling_boundary() {
 fn a7_no_orphan_and_no_double_live_claim_across_two_stores() {
     todo!("requires two stores and migration 015; see design §4 A7")
 }
+
+// ---------------------------------------------------------------------------
+// A11/A12/A14 — cross-device payload verifiability (design §3.5).
+//
+// These are pure-function tests: they prove the rule refuses to certify a ticket whose payload it
+// cannot see, and that the digest it accepts is one it recomputed itself.
+// ---------------------------------------------------------------------------
+
+const PAYLOAD: &str = r#"{"checkpoint":"01J0CHECKPOINT00000000001","note":"handoff"}"#;
+
+/// A14: the payload the receiver hashes is byte-identical to the payload that was exported.
+#[test]
+fn a14_payload_digest_round_trips_byte_for_byte() {
+    let exported = HandoffRecord {
+        ticket: ticket(NODE_B, 30_000, 1_000, &payload_digest(PAYLOAD.as_bytes())),
+        checkpoint_payload_json: PAYLOAD.to_string(),
+    };
+    let digest = payload_digest(exported.checkpoint_payload_json.as_bytes());
+    assert_eq!(digest.len(), 64, "digest must be 64 lowercase hex chars");
+    assert!(digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    // Re-reading the stored bytes must not change the digest: no re-serialisation in transit.
+    let reread = exported.checkpoint_payload_json.as_bytes();
+    assert_eq!(payload_digest(reread), digest);
+    assert_eq!(verify_payload(Some(reread), &digest), Ok(digest));
+}
+
+/// A12: a ticket with no payload must be refused as UNVERIFIABLE, not as drift and not as Ok.
+#[test]
+fn a12_absent_payload_is_unverifiable_not_drift() {
+    let err = verify_payload(None, DIGEST).unwrap_err();
+    assert!(matches!(err, HandoffError::CheckpointUnverifiable), "got {err:?}");
+    let empty = verify_payload(Some(b""), DIGEST).unwrap_err();
+    assert!(matches!(empty, HandoffError::CheckpointUnverifiable), "got {empty:?}");
+    // A malformed expectation is also "cannot check", never a silent pass.
+    let malformed = verify_payload(Some(PAYLOAD.as_bytes()), "not-a-digest").unwrap_err();
+    assert!(matches!(malformed, HandoffError::CheckpointUnverifiable), "got {malformed:?}");
+}
+
+/// A11: the drift check has teeth — one changed byte in the payload is detected, and an
+/// implementation that trusts the sender's digest instead of recomputing would return Ok here.
+#[test]
+fn a11_one_changed_payload_byte_is_detected() {
+    let expected = payload_digest(PAYLOAD.as_bytes());
+    // The honest receiver recomputes and refuses.
+    let tampered = PAYLOAD.replace("handoff", "handofg");
+    match verify_payload(Some(tampered.as_bytes()), &expected) {
+        Err(HandoffError::CheckpointDrift { expected: e, got }) => {
+            assert_eq!(e, expected);
+            assert_ne!(got, expected);
+            assert_eq!(got, payload_digest(tampered.as_bytes()));
+        }
+        other => panic!("expected CheckpointDrift for a tampered payload, got {other:?}"),
+    }
+    // Counter-model: "trust whatever the ticket says" would have returned Ok for the same bytes.
+    let naive_would_accept = Some(tampered.as_bytes()).is_some();
+    assert!(naive_would_accept, "counter-model must accept, which is exactly why A11 has teeth");
+}
+

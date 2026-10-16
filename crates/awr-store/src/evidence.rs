@@ -210,7 +210,11 @@ impl Store {
                         .iter()
                         .any(|scope| scope == key || scope == "*"))
             {
-                let mut assessment = record.assess(source_sha, branch);
+                let mut assessment = record.assess(
+                    source_sha,
+                    work.item.meta.source_ref.section_fingerprint.as_deref(),
+                    branch,
+                );
                 if link_stale || work.source.freshness != Freshness::Fresh {
                     assessment
                         .reasons
@@ -285,7 +289,7 @@ impl Store {
             source: None,
             project_revision: expected,
         }
-        .assess(None, draft.branch_id)
+        .assess(None, None, draft.branch_id)
         .missing_bindings;
         if matches!(
             item.level,
@@ -312,7 +316,31 @@ impl Store {
         self.runtime_transaction(project,expected,event,|tx,_| {
             crate::session::require_branch(tx,project,item.branch_id)?;
             let mut item=item;
-            if let Some(key)=&draft.work_item_key {let work:Projected<WorkItem>=projection(tx,project,EntityKind::WorkItem,key)?;item.work_item_id=Some(work.item.meta.id);}
+            if let Some(key)=&draft.work_item_key {
+                let work:Projected<WorkItem>=projection(tx,project,EntityKind::WorkItem,key)?;
+                item.work_item_id=Some(work.item.meta.id);
+                // Bind the record to the work item's identity+acceptance section as a
+                // second, narrower currency binding on top of the source revision.
+                //
+                // The stamp is only applied when the evidence was recorded against the
+                // work item's *current* source revision. Stamping the current section
+                // onto a record taken from an older revision would exempt that stale
+                // record from the source-SHA drift check entirely.
+                let current = work
+                    .item
+                    .meta
+                    .source_ref
+                    .source_fingerprint
+                    .trim_start_matches("sha256:");
+                let recorded_against_current = item
+                    .source_sha
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(current));
+                if item.section_fingerprint.is_none() && recorded_against_current {
+                    item.section_fingerprint =
+                        work.item.meta.source_ref.section_fingerprint.clone();
+                }
+            }
             let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM evidence WHERE project_id=?1 AND external_key=?2)",params![project.to_string(),item.external_key],|r|r.get(0)).map_err(db_error)?;
             if exists {return Err(Error::SourceConflict(format!("evidence key {} already exists; append a new record",item.external_key)));}
             let level=serde_json::to_value(item.level)?;

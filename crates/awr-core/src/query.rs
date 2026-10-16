@@ -130,7 +130,23 @@ pub fn is_source_sha(value: &str) -> bool {
 }
 
 impl EvidenceRecord {
-    pub fn assess(self, source_sha: Option<&str>, branch: Option<crate::Id>) -> EvidenceAssessment {
+    /// Assess currency relative to an explicitly requested source state.
+    ///
+    /// Ordering is deliberate and non-overridable: the recorded/requested
+    /// **source SHA** is compared first, so a rewritten source can never be
+    /// reported as `Current` merely because the item's contract section still
+    /// matches. Only after the source revision matches is the per-work-item
+    /// section fingerprint (`section_fingerprint`) checked as a second, narrower
+    /// binding against a contract edit the source revision did not reflect. When
+    /// a source SHA is absent on either side the comparison falls back to the
+    /// section binding, and with neither binding available the result is
+    /// `Unknown`.
+    pub fn assess(
+        self,
+        source_sha: Option<&str>,
+        section_fp: Option<&str>,
+        branch: Option<crate::Id>,
+    ) -> EvidenceAssessment {
         let mut reasons = Vec::new();
         let mut missing = Vec::new();
         if self.item.scope.is_empty() {
@@ -166,6 +182,11 @@ impl EvidenceRecord {
         if self.item.verified_at.is_none() {
             missing.push("verified_at".into());
         }
+        let stale = || {
+            self.source
+                .as_ref()
+                .is_some_and(|s| s.freshness != Freshness::Fresh)
+        };
         let currency = if self.item.branch_id != branch {
             reasons.push("evidence belongs to a different branch".into());
             EvidenceCurrency::Historical
@@ -176,11 +197,37 @@ impl EvidenceRecord {
             } else if !recorded.eq_ignore_ascii_case(requested) {
                 reasons.push("evidence was recorded for a different source SHA".into());
                 EvidenceCurrency::Historical
-            } else if self
-                .source
-                .as_ref()
-                .is_some_and(|s| s.freshness != Freshness::Fresh)
+            } else if let (Some(recorded_section), Some(requested_section)) =
+                (self.item.section_fingerprint.as_deref(), section_fp)
             {
+                if !recorded_section.eq_ignore_ascii_case(requested_section) {
+                    reasons.push(
+                        "evidence was recorded against a different work section (identity+acceptance)"
+                            .into(),
+                    );
+                    EvidenceCurrency::Historical
+                } else if stale() {
+                    reasons.push("evidence source is not fresh".into());
+                    EvidenceCurrency::Unknown
+                } else {
+                    EvidenceCurrency::Current
+                }
+            } else if stale() {
+                reasons.push("evidence source is not fresh".into());
+                EvidenceCurrency::Unknown
+            } else {
+                EvidenceCurrency::Current
+            }
+        } else if let (Some(recorded_section), Some(requested_section)) =
+            (self.item.section_fingerprint.as_deref(), section_fp)
+        {
+            if !recorded_section.eq_ignore_ascii_case(requested_section) {
+                reasons.push(
+                    "evidence was recorded against a different work section (identity+acceptance)"
+                        .into(),
+                );
+                EvidenceCurrency::Historical
+            } else if stale() {
                 reasons.push("evidence source is not fresh".into());
                 EvidenceCurrency::Unknown
             } else {

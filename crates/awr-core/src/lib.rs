@@ -7,6 +7,7 @@ mod branch;
 mod branch_close;
 mod completion;
 mod error;
+pub mod device_handoff;
 mod event_payload;
 mod execution;
 mod execution_adapter;

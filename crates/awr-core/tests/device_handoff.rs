@@ -1,141 +1,27 @@
-//! Spec tests for cross-device session handoff — design FEAT-XDH-001 v1.0.
+//! Cross-device session handoff — design FEAT-XDH-001 v1.1, acceptance A1–A10.
 //!
-//! See `reports/feature-cross-device-handoff-design-v1.0.md` §3.2–§3.4 (ticket, clock
-//! normalisation, redemption) and §4 (A1–A8).
+//! These tests call the **production** rule in `awr_core::device_handoff`, not a local copy: a
+//! green run must mean the shipped functions are correct. The only in-file code is the pair of
+//! deliberately wrong implementations that A2b needs as counterexamples.
 //!
-//! TODO(design-approval): replace the throwaway `reference` module below with
-//! `awr_core::device_handoff` once the production module lands. Until then this file pins the
-//! *specification* so the redemption rule can be reviewed and run before any storage change.
+//! Contract under test (review v1.1): this feature does **not** cancel clock skew. It bounds it —
+//! a ticket may not overstate its budget (`remaining_ms <= declared_ttl - MARGIN_MS`), and the
+//! receiver may only shorten the lease.
 //!
-//! TODO(verify): **never executed** on the authoring host — `cargo`, `rustc` and `link.exe` do not
-//! resolve there at all, so this file has never been compiled and is not claimed to be
-//! `cargo fmt` clean. A passing result may only be quoted with a CI run id.
+//! TODO(verify): **never executed** on the authoring host — `rustc`, `cargo`, `rustup`, `link`,
+//! `cc`, `gcc` and `clang` are all MISSING there (`reports/env-probe-v1.json`), so this file has
+//! never been compiled and is not claimed to be `cargo fmt` clean. A passing result may only be
+//! quoted with a CI run id.
 
-use sha2::{Digest, Sha256};
-
-/// Throwaway reference implementation of the normative redemption rule. Not production code.
-mod reference {
-    use serde_json::{json, Value};
-    use std::collections::BTreeMap;
-
-    /// A portable handoff ticket (design §3.2). Search keys are `work_key` / `branch_name`;
-    /// every ULID field is audit-only, because ULID spaces of two devices do not intersect.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct HandoffTicket {
-        pub ticket_id: String,
-        pub work_key: String,
-        pub branch_name: String,
-        pub from_node_id: String,
-        pub to_node_id: String,
-        pub sender_session_id: String,
-        pub checkpoint_id: String,
-        pub checkpoint_digest: String,
-        /// Sender's own wall clock. Audit-only: the rule must never read it (§3.3).
-        pub sender_clock_ms: i64,
-        pub issued_at_ms: i64,
-        /// `deadline − sender_clock` as the sender believed it.
-        pub remaining_ms: i64,
-        pub closed_claim_ids: Vec<String>,
-    }
-
-    /// Receiver-side facts. Nothing here is trusted from the sender's clock but `remaining_ms`.
-    #[derive(Debug, Clone)]
-    pub struct RedeemInput {
-        pub receiver_node_id: String,
-        pub receiver_at_ms: i64,
-        pub rtt_ms: i64,
-        pub target_resolved: bool,
-        pub local_checkpoint_digest: String,
-        pub redeemed_ticket_ids: Vec<String>,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum HandoffError {
-        NodeMismatch { expected: String, got: String },
-        TargetUnresolved { work_key: String, branch_name: String },
-        CheckpointDrift { expected: String, got: String },
-        TicketAlreadyRedeemed { ticket_id: String },
-        ClaimExpired { remaining_ms: i64 },
-    }
-
-    /// Redemption validation, in the fixed order of design §3.4. The order is part of the
-    /// contract: a ticket that is wrong in two ways must fail the same way every time, so the
-    /// refusal is reproducible rather than a product of check scheduling.
-    pub fn validate_ticket(
-        t: &HandoffTicket,
-        i: &RedeemInput,
-    ) -> Result<(), HandoffError> {
-        if t.to_node_id != i.receiver_node_id {
-            return Err(HandoffError::NodeMismatch {
-                expected: t.to_node_id.clone(),
-                got: i.receiver_node_id.clone(),
-            });
-        }
-        if !i.target_resolved {
-            return Err(HandoffError::TargetUnresolved {
-                work_key: t.work_key.clone(),
-                branch_name: t.branch_name.clone(),
-            });
-        }
-        if i.local_checkpoint_digest != t.checkpoint_digest {
-            return Err(HandoffError::CheckpointDrift {
-                expected: t.checkpoint_digest.clone(),
-                got: i.local_checkpoint_digest.clone(),
-            });
-        }
-        if i.redeemed_ticket_ids.iter().any(|id| id == &t.ticket_id) {
-            return Err(HandoffError::TicketAlreadyRedeemed {
-                ticket_id: t.ticket_id.clone(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Clock normalisation (design §3.3): the receiver rebuilds the deadline on its own clock and
-    /// may only **shorten** it. Mirrors the upstream precedent in
-    /// `crates/awr-team-pg/src/scoped_runner.rs:119` — subtract the entire round trip.
-    pub fn local_deadline_ms(
-        t: &HandoffTicket,
-        receiver_at_ms: i64,
-        rtt_ms: i64,
-    ) -> Result<i64, HandoffError> {
-        if t.remaining_ms <= 0 {
-            return Err(HandoffError::ClaimExpired {
-                remaining_ms: t.remaining_ms,
-            });
-        }
-        let budget = t.remaining_ms.saturating_sub(rtt_ms);
-        Ok(receiver_at_ms.saturating_add(budget))
-    }
-
-    /// Canonical, byte-stable ticket JSON: sorted keys, integers only, `closed_claim_ids` sorted.
-    pub fn canonical_ticket_json(t: &HandoffTicket) -> Value {
-        let mut closed = t.closed_claim_ids.clone();
-        closed.sort();
-        let mut m = BTreeMap::new();
-        m.insert("branch_name", json!(t.branch_name));
-        m.insert("checkpoint_digest", json!(t.checkpoint_digest));
-        m.insert("checkpoint_id", json!(t.checkpoint_id));
-        m.insert("closed_claim_ids", json!(closed));
-        m.insert("from_node_id", json!(t.from_node_id));
-        m.insert("issued_at_ms", json!(t.issued_at_ms));
-        m.insert("remaining_ms", json!(t.remaining_ms));
-        m.insert("sender_clock_ms", json!(t.sender_clock_ms));
-        m.insert("sender_session_id", json!(t.sender_session_id));
-        m.insert("ticket_id", json!(t.ticket_id));
-        m.insert("to_node_id", json!(t.to_node_id));
-        m.insert("work_key", json!(t.work_key));
-        Value::Object(m.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
-    }
-}
-
-use reference::{
-    canonical_ticket_json, local_deadline_ms, validate_ticket, HandoffError, HandoffTicket,
-    RedeemInput,
+use awr_core::device_handoff::{
+    canonical_ticket_digest, canonical_ticket_json, local_deadline_ms,
+    local_deadline_ms_naive_extend, local_deadline_ms_naive_sender_clock, remaining_ceiling_ms,
+    validate_ticket, HandoffError, HandoffTicket, RedeemInput, MARGIN_MS,
 };
-use serde_json::Value;
 
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const NODE_B: &str = "sha256:bbbb";
+const DECLARED_TTL_MS: i64 = 60_000;
 
 fn ticket(to_node: &str, remaining_ms: i64, sender_clock_ms: i64, digest: &str) -> HandoffTicket {
     HandoffTicket {
@@ -149,9 +35,20 @@ fn ticket(to_node: &str, remaining_ms: i64, sender_clock_ms: i64, digest: &str) 
         checkpoint_digest: digest.to_string(),
         sender_clock_ms,
         issued_at_ms: sender_clock_ms,
+        sender_declared_ttl_ms: DECLARED_TTL_MS,
         remaining_ms,
         closed_claim_ids: vec!["01J0CLAIM-B".to_string(), "01J0CLAIM-A".to_string()],
     }
+}
+
+/// A ticket at exactly the admissible ceiling, which is the interesting boundary case.
+fn admissible_ticket(to_node: &str, sender_clock_ms: i64) -> HandoffTicket {
+    ticket(
+        to_node,
+        remaining_ceiling_ms(DECLARED_TTL_MS),
+        sender_clock_ms,
+        DIGEST,
+    )
 }
 
 fn input(node: &str, at: i64, rtt: i64, resolved: bool, digest: &str) -> RedeemInput {
@@ -165,17 +62,17 @@ fn input(node: &str, at: i64, rtt: i64, resolved: bool, digest: &str) -> RedeemI
     }
 }
 
-fn sha256_hex(s: &str) -> String {
-    Sha256::digest(s.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+/// The assertion that makes A2 non-trivial: the bound is stated in terms of the **declared** TTL,
+/// the margin and the round trip — three inputs other than the `remaining_ms` the ticket forwards.
+/// An implementation that amplifies skew or re-grants the full TTL breaks it.
+fn admissible_bound(receiver_at_ms: i64, declared_ttl_ms: i64, rtt_ms: i64) -> i64 {
+    receiver_at_ms + declared_ttl_ms - MARGIN_MS - rtt_ms
 }
 
 /// A1 — a ticket addressed to another device is refused.
 #[test]
 fn a1_ticket_for_another_node_is_refused() {
-    let t = ticket("sha256:bbbb", 60_000, 1_000, DIGEST);
+    let t = admissible_ticket("sha256:bbbb", 1_000);
     let i = input("sha256:cccc", 2_000, 0, true, DIGEST);
     match validate_ticket(&t, &i) {
         Err(HandoffError::NodeMismatch { expected, got }) => {
@@ -186,12 +83,11 @@ fn a1_ticket_for_another_node_is_refused() {
     }
 }
 
-/// A2 — the receiver's deadline is a fixed function of its own clock and `remaining_ms` only.
+/// A2 — the receiver's deadline is bounded by the *declared* TTL and never reads the sender clock.
 #[test]
-fn a2_receiver_deadline_ignores_the_sender_clock_and_never_extends() {
+fn a2_deadline_is_bounded_and_ignores_the_sender_clock() {
     let receiver_at = 10_000_000i64;
     let rtt = 250i64;
-    let remaining = 60_000i64;
 
     let mut observed = Vec::new();
     for sender_clock in [
@@ -199,36 +95,85 @@ fn a2_receiver_deadline_ignores_the_sender_clock_and_never_extends() {
         receiver_at,
         receiver_at + 10_000_000,
     ] {
-        let t = ticket("node-b", remaining, sender_clock, DIGEST);
+        let t = admissible_ticket(NODE_B, sender_clock);
+        let i = input(NODE_B, receiver_at, rtt, true, DIGEST);
+        validate_ticket(&t, &i).expect("ticket is admissible");
+
         let deadline = local_deadline_ms(&t, receiver_at, rtt).expect("positive budget");
-        // Upper bound: never beyond what the sender believed, minus the whole round trip.
+        let bound = admissible_bound(receiver_at, DECLARED_TTL_MS, rtt);
         assert!(
-            deadline <= receiver_at + remaining - rtt,
-            "deadline extends beyond the sender's belief"
+            deadline <= bound,
+            "deadline {deadline} exceeds the admissible bound {bound}"
         );
         observed.push(deadline);
     }
     assert_eq!(
         observed[0], observed[1],
-        "deadline moved with the sender clock (−10^7 vs 0)"
+        "deadline moved with the sender clock (-10^7 vs 0)"
     );
     assert_eq!(
         observed[1], observed[2],
         "deadline moved with the sender clock (0 vs +10^7)"
     );
 
-    // Monotone in the round trip: a slower transfer can only shorten the budget.
-    let slower = local_deadline_ms(&ticket("node-b", remaining, 0, DIGEST), receiver_at, rtt * 4)
-        .expect("positive budget");
-    assert!(slower < observed[0], "a larger rtt must strictly shorten the deadline");
+    // Monotone in the round trip: a slower transfer can only shorten the lease.
+    let t = admissible_ticket(NODE_B, receiver_at);
+    let slower = local_deadline_ms(&t, receiver_at, rtt * 4).expect("positive budget");
+    assert!(
+        slower < observed[0],
+        "a larger rtt must strictly shorten the deadline"
+    );
+}
+
+/// A2b — the counterexample that gives A2 its teeth.
+///
+/// Two deliberately wrong implementations, both of which violate the bound A2 asserts. The
+/// sender-clock variant additionally returns **different** deadlines for a shifted sender clock,
+/// which is exactly the drift A2's equality assertion exists to catch.
+#[test]
+fn a2b_skew_amplifying_and_extending_implementations_violate_the_bound() {
+    let receiver_at = 10_000_000i64;
+    let rtt = 250i64;
+    let bound = admissible_bound(receiver_at, DECLARED_TTL_MS, rtt);
+
+    let fast_sender = admissible_ticket(NODE_B, receiver_at + 10_000_000);
+    let amplifying = local_deadline_ms_naive_sender_clock(&fast_sender, receiver_at, rtt);
+    assert!(
+        amplifying > bound,
+        "the skew-amplifying implementation must break the bound ({amplifying} vs {bound})"
+    );
+
+    let extending = local_deadline_ms_naive_extend(&fast_sender, receiver_at, rtt);
+    assert!(
+        extending > bound,
+        "the re-granting implementation must break the bound ({extending} vs {bound})"
+    );
+
+    // Discriminating power: a sender-clock-reading rule is not shift-invariant, so A2 could fail.
+    let slow_sender = admissible_ticket(NODE_B, receiver_at - 10_000_000);
+    assert_ne!(
+        local_deadline_ms_naive_sender_clock(&fast_sender, receiver_at, rtt),
+        local_deadline_ms_naive_sender_clock(&slow_sender, receiver_at, rtt),
+        "the counterexample must move with the sender clock, otherwise A2 proves nothing"
+    );
+
+    // Meanwhile the production rule is shift-invariant on the same two tickets.
+    assert_eq!(
+        local_deadline_ms(&fast_sender, receiver_at, rtt).expect("positive budget"),
+        local_deadline_ms(&slow_sender, receiver_at, rtt).expect("positive budget"),
+        "the production rule must not move with the sender clock"
+    );
 }
 
 /// A3 — redeeming the same ticket twice must be refused (exactly-once at the rule level).
 #[test]
 fn a3_second_redemption_of_the_same_ticket_is_refused() {
-    let t = ticket("node-b", 60_000, 1_000, DIGEST);
-    let mut i = input("node-b", 2_000, 10, true, DIGEST);
-    assert!(validate_ticket(&t, &i).is_ok(), "first redemption must validate");
+    let t = admissible_ticket(NODE_B, 1_000);
+    let mut i = input(NODE_B, 2_000, 10, true, DIGEST);
+    assert!(
+        validate_ticket(&t, &i).is_ok(),
+        "first redemption must validate"
+    );
     i.redeemed_ticket_ids.push(t.ticket_id.clone());
     match validate_ticket(&t, &i) {
         Err(HandoffError::TicketAlreadyRedeemed { ticket_id }) => {
@@ -242,7 +187,7 @@ fn a3_second_redemption_of_the_same_ticket_is_refused() {
 #[test]
 fn a4_non_positive_remaining_budget_is_refused() {
     for remaining in [0i64, -1, -60_000] {
-        let t = ticket("node-b", remaining, 1_000, DIGEST);
+        let t = ticket(NODE_B, remaining, 1_000, DIGEST);
         match local_deadline_ms(&t, 2_000, 0) {
             Err(HandoffError::ClaimExpired { remaining_ms }) => assert_eq!(remaining_ms, remaining),
             other => panic!("expected ClaimExpired for remaining={remaining}, got {other:?}"),
@@ -253,8 +198,8 @@ fn a4_non_positive_remaining_budget_is_refused() {
 /// A5 — a checkpoint whose content no longer matches the ticket digest is a drift, not an inherit.
 #[test]
 fn a5_checkpoint_drift_is_refused() {
-    let t = ticket("node-b", 60_000, 1_000, DIGEST);
-    let i = input("node-b", 2_000, 0, true, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let t = admissible_ticket(NODE_B, 1_000);
+    let i = input(NODE_B, 2_000, 0, true, &"b".repeat(64));
     match validate_ticket(&t, &i) {
         Err(HandoffError::CheckpointDrift { expected, got }) => {
             assert_eq!(expected, DIGEST);
@@ -267,31 +212,39 @@ fn a5_checkpoint_drift_is_refused() {
 /// A6 — the ticket record is reproducible and carries no floating point.
 #[test]
 fn a6_ticket_record_is_reproducible_and_hashable() {
-    let t = ticket("node-b", 60_000, 1_000, DIGEST);
-    let a = canonical_ticket_json(&t).to_string();
-    let b = canonical_ticket_json(&t.clone()).to_string();
-    assert_eq!(a, b, "ticket record is not reproducible for an identical input");
-    assert!(!a.contains('.'), "ticket record must contain no floating point: {a}");
-    let hash = sha256_hex(&a);
-    assert_eq!(hash.len(), 64);
-    assert!(hash.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+    let t = admissible_ticket(NODE_B, 1_000);
+    let a = canonical_ticket_json(&t).expect("record");
+    let b = canonical_ticket_json(&t.clone()).expect("record");
+    assert_eq!(
+        a, b,
+        "ticket record is not reproducible for an identical input"
+    );
+    assert!(
+        !a.contains('.'),
+        "ticket record must contain no floating point: {a}"
+    );
+    let digest = canonical_ticket_digest(&t).expect("digest");
+    assert_eq!(digest.len(), 64);
+    assert!(digest
+        .chars()
+        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
 
     // Claim-id ordering must not leak into the record.
     let mut shuffled = t.clone();
     shuffled.closed_claim_ids.reverse();
     assert_eq!(
-        canonical_ticket_json(&shuffled).to_string(),
+        canonical_ticket_json(&shuffled).expect("record"),
         a,
         "record changed when closed_claim_ids were reordered"
     );
 }
 
-/// A9 (added) — the refusal is deterministic when a ticket is wrong in several ways at once.
+/// A9 — the refusal is deterministic when a ticket is wrong in several ways at once.
 #[test]
 fn a9_validation_order_is_fixed() {
     // Wrong node AND drifted checkpoint AND already redeemed: the node check must win.
-    let t = ticket("sha256:bbbb", 60_000, 1_000, DIGEST);
-    let mut i = input("sha256:cccc", 2_000, 0, true, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    let t = admissible_ticket("sha256:bbbb", 1_000);
+    let mut i = input("sha256:cccc", 2_000, 0, true, &"c".repeat(64));
     i.redeemed_ticket_ids.push(t.ticket_id.clone());
     assert!(matches!(
         validate_ticket(&t, &i),
@@ -299,38 +252,72 @@ fn a9_validation_order_is_fixed() {
     ));
 
     // Right node, unresolvable target AND drifted checkpoint: the target check must win.
-    let t = ticket("node-b", 60_000, 1_000, DIGEST);
-    let i = input("node-b", 2_000, 0, false, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    let t = admissible_ticket(NODE_B, 1_000);
+    let i = input(NODE_B, 2_000, 0, false, &"c".repeat(64));
     assert!(matches!(
         validate_ticket(&t, &i),
         Err(HandoffError::TargetUnresolved { .. })
     ));
 
     // Right node, resolvable target, drifted checkpoint AND redeemed: drift must win.
-    let i = input("node-b", 2_000, 0, true, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
-    let mut i2 = i;
-    i2.redeemed_ticket_ids.push(t.ticket_id.clone());
+    let mut i = input(NODE_B, 2_000, 0, true, &"c".repeat(64));
+    i.redeemed_ticket_ids.push(t.ticket_id.clone());
     assert!(matches!(
-        validate_ticket(&t, &i2),
+        validate_ticket(&t, &i),
         Err(HandoffError::CheckpointDrift { .. })
+    ));
+
+    // Right node, resolvable target, matching checkpoint, redeemed AND overstated: the
+    // already-redeemed check must win over the budget check.
+    let mut i = input(NODE_B, 2_000, 0, true, DIGEST);
+    i.redeemed_ticket_ids.push(t.ticket_id.clone());
+    let overstated = ticket(NODE_B, DECLARED_TTL_MS, 1_000, DIGEST);
+    assert!(matches!(
+        validate_ticket(&overstated, &i),
+        Err(HandoffError::TicketAlreadyRedeemed { .. })
     ));
 }
 
-/// A7 (store layer) and A3's row-count half need two real ledgers, so they are declared here and
-/// left unimplemented until the design is approved; they belong in
-/// `crates/awr-store/tests/device_handoff.rs` (design §4, §5).
+/// A10 — a ticket may not forward more budget than the sender was granted, minus the margin.
 #[test]
-#[ignore = "TODO: A7 needs migration 015 + a second store (design §3.4/§4); not implemented"]
-fn a7_no_orphan_and_no_double_live_claim_across_two_stores() {
-    todo!("requires two stores and migration 015; see design §4 A7")
+fn a10_overstated_budget_is_refused_at_the_ceiling_boundary() {
+    let ceiling = remaining_ceiling_ms(DECLARED_TTL_MS);
+    assert_eq!(ceiling, DECLARED_TTL_MS - MARGIN_MS);
+
+    let at_ceiling = ticket(NODE_B, ceiling, 1_000, DIGEST);
+    let i = input(NODE_B, 2_000, 0, true, DIGEST);
+    assert!(
+        validate_ticket(&at_ceiling, &i).is_ok(),
+        "exactly at the ceiling must be admissible"
+    );
+
+    let over_ceiling = ticket(NODE_B, ceiling + 1, 1_000, DIGEST);
+    match validate_ticket(&over_ceiling, &i) {
+        Err(HandoffError::TicketOverstated {
+            remaining_ms,
+            ceiling_ms,
+        }) => {
+            assert_eq!(remaining_ms, ceiling + 1);
+            assert_eq!(ceiling_ms, ceiling);
+        }
+        other => panic!("expected TicketOverstated, got {other:?}"),
+    }
+
+    // A ticket that forwards the whole declared TTL is the common mistake, and must be refused.
+    let whole_ttl = ticket(NODE_B, DECLARED_TTL_MS, 1_000, DIGEST);
+    assert!(matches!(
+        validate_ticket(&whole_ttl, &i),
+        Err(HandoffError::TicketOverstated { .. })
+    ));
 }
 
-/// Keeps the audit-only fields meaningful: they must survive into the record even though the rule
-/// never reads them (design §3.2/§3.3).
+/// A7 is a storage-layer criterion (design §4), so it is declared here, ignored, and left
+/// unimplemented until migration `015_device_handoff.sql` and the `handoff.rs` export/redeem pair
+/// land. Its body belongs in `crates/awr-store/tests/device_handoff.rs` and must assert, across two
+/// real stores: the sender's active claim count is 0 and its session is incomplete/interrupted,
+/// while the receiver's active claim count is exactly 1.
 #[test]
-fn sender_clock_is_recorded_but_never_used() {
-    let t = ticket("node-b", 60_000, 4_242, DIGEST);
-    let record: Value = canonical_ticket_json(&t);
-    assert_eq!(record["sender_clock_ms"], serde_json::json!(4_242));
-    assert_eq!(record["remaining_ms"], serde_json::json!(60_000));
+#[ignore = "TODO: A7 needs migration 015 + handoff.rs export/redeem over two stores (design §3.4/§4); not implemented"]
+fn a7_no_orphan_and_no_double_live_claim_across_two_stores() {
+    todo!("requires two stores and migration 015; see design §4 A7")
 }

@@ -1,6 +1,7 @@
 //! Coordination ownership under the authenticated command transaction. A claim
 //! is not dependency admission, a resource lease, or permission to run effects.
 use super::*;
+use crate::{ClaimHolder, ClaimRejection};
 use tokio_postgres::Row;
 
 #[derive(Deserialize)]
@@ -201,6 +202,41 @@ pub(super) async fn apply(
     Ok(applied)
 }
 
+/// Build a structured `claim.acquire` refusal from state the coordinator
+/// already holds. The only statement executed here is a clock read.
+#[allow(clippy::too_many_arguments)]
+async fn rejected(
+    tx: &tokio_postgres::Transaction<'_>,
+    code: &'static str,
+    reason: &'static str,
+    current_fence: i64,
+    current_epoch: &str,
+    expected_epoch: Option<String>,
+    work_state: &str,
+    holder: Option<ClaimHolder>,
+    retry_after_ms: Option<i64>,
+) -> PgError {
+    let observed_at_ms = tx
+        .query_one(
+            "SELECT (extract(epoch from clock_timestamp())*1000)::bigint",
+            &[],
+        )
+        .await
+        .map(|row| row.get::<_, i64>(0))
+        .unwrap_or(0);
+    PgError::ClaimRejected(Box::new(ClaimRejection {
+        code,
+        reason,
+        observed_at_ms,
+        current_fence,
+        current_epoch: current_epoch.into(),
+        expected_epoch,
+        work_state: work_state.into(),
+        holder,
+        retry_after_ms,
+    }))
+}
+
 pub(super) fn lease_guidance(claim: &str, fence: &str, lease: &str, expires_at: &str) -> Value {
     json!({
         "condition": "While the matching owned claim remains live.",
@@ -257,7 +293,12 @@ async fn acquire(
         .as_ref()
         .map(|r| (r.get::<_, i64>(0), r.get::<_, i64>(1)))
         .unwrap_or((0, 0));
-    if work_version != version(&a.expected_work_version)?
+    let work_state = runtime
+        .as_ref()
+        .map(|r| r.get::<_, String>(2))
+        .unwrap_or_else(|| "missing".into());
+    let expected_work_version = version(&a.expected_work_version)?;
+    if work_version != expected_work_version
         || work_version == i64::MAX
         || fence == i64::MAX
         || fence < 0
@@ -268,24 +309,85 @@ async fn acquire(
             ) || r.get::<_, Option<String>>(3).is_some()
         })
     {
-        return Err(PgError::PreconditionsChanged);
+        // A caller whose view is behind the coordinator fence gets stale_fence;
+        // any other mismatch means its intent no longer matches this work item.
+        let reason = if work_version > expected_work_version {
+            "stale_fence"
+        } else {
+            "expired_intent"
+        };
+        return Err(rejected(
+            tx,
+            "PreconditionsChanged",
+            reason,
+            fence,
+            &auth.epoch,
+            None,
+            &work_state,
+            None,
+            None,
+        )
+        .await);
     }
-    let active=tx.query_opt("SELECT id,workstream_id,ownership_version,coordinator_epoch,expires_at>clock_timestamp(),fence
+    let active=tx.query_opt("SELECT id,workstream_id,ownership_version,coordinator_epoch,expires_at>clock_timestamp(),fence,
+        session_id,expires_at::text,GREATEST((extract(epoch from (expires_at-clock_timestamp()))*1000)::bigint,0)
         FROM awr_team.claims WHERE tenant_id=$1 AND project_id=$2 AND scope_id='main' AND work_id=$3 AND state='active' FOR UPDATE",
         &[&tenant,&project,&command.work_id]).await?;
     let mut events = vec![];
     if let Some(r) = active {
         // Reassignment and restore require an explicit recovery/migration path;
         // an elapsed old row must not be attributed to the new workstream.
+        let stored_epoch: Option<String> = r.get(3);
+        if stored_epoch.as_deref() != Some(auth.epoch.as_str()) {
+            return Err(rejected(
+                tx,
+                "RecoveryBlocked",
+                "epoch_mismatch",
+                fence,
+                &auth.epoch,
+                stored_epoch,
+                &work_state,
+                None,
+                None,
+            )
+            .await);
+        }
         if r.get::<_, Option<String>>(1) != Some(command.workstream_id.to_string())
             || r.get::<_, Option<i64>>(2) != Some(ownership)
-            || r.get::<_, Option<String>>(3) != Some(auth.epoch.clone())
             || r.get::<_, i64>(5) != fence
         {
-            return Err(PgError::RecoveryBlocked);
+            return Err(rejected(
+                tx,
+                "RecoveryBlocked",
+                "expired_intent",
+                fence,
+                &auth.epoch,
+                None,
+                &work_state,
+                None,
+                None,
+            )
+            .await);
         }
         if r.get::<_, bool>(4) {
-            return Err(PgError::ClaimHeld);
+            let holder = ClaimHolder {
+                claim_id: r.get(0),
+                node: Some(r.get(6)),
+                fence: r.get(5),
+                expires_at: r.get(7),
+            };
+            return Err(rejected(
+                tx,
+                "ClaimHeld",
+                "lease_live",
+                fence,
+                &auth.epoch,
+                None,
+                &work_state,
+                Some(holder),
+                Some(r.get(8)),
+            )
+            .await);
         }
         let id: String = r.get(0);
         tx.execute("UPDATE awr_team.claims SET state='expired' WHERE tenant_id=$1 AND project_id=$2 AND id=$3",

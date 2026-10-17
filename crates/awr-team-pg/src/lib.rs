@@ -53,7 +53,7 @@ pub use delivery_sync::{
     RejectPreparedDeliveryIntegration, RenewDeliveryPublicationLease, ReserveDeliveryInspection,
     SelectDeliveryCandidate,
 };
-pub use error::{PgError, PgResult};
+pub use error::{ClaimHolder, ClaimRejection, PgError, PgResult};
 pub use execution::{
     ExecutionRecord, ExecutionStore, OutboxDelivery, admit_live_fence, exactly_once_supported,
     unknown_effect_retains_resources,

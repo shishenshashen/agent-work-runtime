@@ -42,6 +42,23 @@ async fn snapshot(admin: &Client) -> Value {
         'revision',(SELECT project_revision FROM awr_team.projects WHERE tenant_id=$1 AND id=$2))",
         &[&TENANT,&PROJECT]).await.unwrap().get(0)
 }
+fn rejection(err: PgError) -> Value {
+    match err {
+        PgError::ClaimRejected(rejection) => rejection.to_value(),
+        other => panic!("expected a structured claim rejection, got {other:?}"),
+    }
+}
+/// A rejected `claim.acquire` must leave every stored row and the project revision
+/// byte-for-byte identical; the revision is named separately because callers and the
+/// maintainer contract both point at it.
+async fn unchanged(admin: &Client, before: &Value) {
+    let after = snapshot(admin).await;
+    assert_eq!(
+        after["revision"], before["revision"],
+        "a rejected claim moved project_revision"
+    );
+    assert_eq!(&after, before, "a rejected claim mutated stored state");
+}
 
 #[tokio::test]
 async fn owned_leases_renew_release_and_replay_only_historical_receipts() {
@@ -232,12 +249,15 @@ async fn concurrent_claims_have_one_owner_and_exact_retries_do_not_advance_fence
         one.err().or(two.err()),
         Some(PgError::PreconditionsChanged)
     ));
-    assert!(matches!(
-        commands
-            .execute(TENANT, PROJECT, A, acquire(&store, "third").await)
-            .await,
-        Err(PgError::ClaimHeld)
-    ));
+    assert_eq!(
+        rejection(
+            commands
+                .execute(TENANT, PROJECT, A, acquire(&store, "third").await)
+                .await
+                .unwrap_err()
+        )["reason"],
+        "lease_live"
+    );
     let r=admin.query_one("SELECT last_fence,(SELECT count(*) FROM awr_team.claims WHERE state='active') FROM awr_team.work_runtime",&[]).await.unwrap();
     assert_eq!(r.get::<_, i64>(0), 2);
     assert_eq!(r.get::<_, i64>(1), 1);
@@ -824,4 +844,76 @@ async fn claim_inspect_never_sets_execution_authorized() {
     let other = inspect(&store, B, &claim).await;
     assert_eq!(other["execution_authorized"], false);
     assert_eq!(other["owned_by_client"], false);
+}
+
+#[tokio::test]
+async fn claim_acquire_rejections_name_the_cause_and_change_no_state() {
+    let (_guard, admin, _, store) = setup().await;
+    enable_writes(&admin).await;
+    let commands = store.commands();
+
+    // A live claim makes the next attempt lease_live, naming the holder and its expiry.
+    let request = acquire(&store, "first").await;
+    let claim =
+        commands.execute(TENANT, PROJECT, A, request).await.unwrap()["receipt"]["data"].clone();
+    let fence = claim["fence"].as_str().unwrap().parse::<i64>().unwrap();
+    let before = snapshot(&admin).await;
+    let rejected = match commands
+        .execute(TENANT, PROJECT, A, acquire(&store, "second").await)
+        .await
+    {
+        Err(PgError::ClaimRejected(rejection)) => rejection.to_value(),
+        other => panic!("expected a structured claim rejection, got {other:?}"),
+    };
+    assert_eq!(rejected["code"], "ClaimHeld");
+    assert_eq!(rejected["reason"], "lease_live");
+    assert_eq!(rejected["holder"]["claim_id"], claim["claim_id"]);
+    assert_eq!(rejected["holder"]["fence"], json!(fence));
+    assert_eq!(rejected["holder"]["node"], "session-a");
+    assert!(rejected["retry_after_ms"].as_i64().unwrap_or(0) > 0);
+    unchanged(&admin, &before).await;
+
+    // A caller behind the coordinator fence is told stale_fence with the current fence.
+    let mut stale = acquire(&store, "stale").await;
+    stale.args["expected_work_version"] = json!("0");
+    let before = snapshot(&admin).await;
+    let rejected = match commands.execute(TENANT, PROJECT, A, stale).await {
+        Err(PgError::ClaimRejected(rejection)) => rejection.to_value(),
+        other => panic!("expected stale_fence, got {other:?}"),
+    };
+    assert_eq!(rejected["reason"], "stale_fence");
+    assert_eq!(rejected["current_fence"], json!(fence));
+    assert_eq!(rejected["work_state"], "claimed");
+    unchanged(&admin, &before).await;
+
+    // An intent formed against a newer state is expired, not a version conflict.
+    let mut expired = acquire(&store, "expired").await;
+    expired.args["expected_work_version"] = json!("999");
+    let before = snapshot(&admin).await;
+    let rejected = match commands.execute(TENANT, PROJECT, A, expired).await {
+        Err(PgError::ClaimRejected(rejection)) => rejection.to_value(),
+        other => panic!("expected expired_intent, got {other:?}"),
+    };
+    assert_eq!(rejected["reason"], "expired_intent");
+    unchanged(&admin, &before).await;
+
+    // A coordinator epoch change is named on both sides and still writes nothing.
+    admin
+        .execute(
+            "UPDATE awr_team.claims SET coordinator_epoch='restored-epoch' WHERE tenant_id=$1 AND project_id=$2",
+            &[&TENANT, &PROJECT],
+        )
+        .await
+        .unwrap();
+    let mut epoch = acquire(&store, "epoch").await;
+    epoch.args["expected_work_version"] = claim["work_version"].clone();
+    let before = snapshot(&admin).await;
+    let rejected = match commands.execute(TENANT, PROJECT, A, epoch).await {
+        Err(PgError::ClaimRejected(rejection)) => rejection.to_value(),
+        other => panic!("expected epoch_mismatch, got {other:?}"),
+    };
+    assert_eq!(rejected["reason"], "epoch_mismatch");
+    assert_eq!(rejected["current_epoch"], "epoch-a");
+    assert_eq!(rejected["expected_epoch"], "restored-epoch");
+    unchanged(&admin, &before).await;
 }

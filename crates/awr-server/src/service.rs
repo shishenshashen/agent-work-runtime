@@ -1133,6 +1133,7 @@ fn public_error(error: PgError) -> (StatusCode, Value) {
                 "next_step":"if this was session.checkpoint, inspect the session, consume a fresh work.prepare for the same session/work, and rebuild with the current session_version and fresh context_hash; session.inspect's context_hash is historical"
             }),
         ),
+        PgError::ClaimRejected(rejection) => (StatusCode::CONFLICT, rejection.to_value()),
         e @ (PgError::IdempotencyConflict
         | PgError::EpochChanged
         | PgError::ProjectNotAvailable

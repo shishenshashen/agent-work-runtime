@@ -115,6 +115,68 @@ pub enum PgError {
     Pool(#[from] deadpool_postgres::PoolError),
     #[error("{0}")]
     Protocol(String),
+    /// A `claim.acquire` refusal that names the state the caller collided with.
+    /// The coordinator remains the only authority: this payload is descriptive
+    /// and is produced before any claim row, fence, epoch or revision changes.
+    #[error("{0}")]
+    ClaimRejected(Box<ClaimRejection>),
+}
+
+/// Why `claim.acquire` refused, and the coordinator state that caused it.
+///
+/// `code` keeps the public error code callers already receive; `reason` is the
+/// machine-readable cause. All fields describe state observed at rejection
+/// time and never reserve, renew or release anything.
+#[derive(Debug, Clone)]
+pub struct ClaimRejection {
+    pub code: &'static str,
+    pub reason: &'static str,
+    pub observed_at_ms: i64,
+    pub current_fence: i64,
+    pub current_epoch: String,
+    pub expected_epoch: Option<String>,
+    pub work_state: String,
+    pub holder: Option<ClaimHolder>,
+    pub retry_after_ms: Option<i64>,
+}
+
+/// The live claim a caller collided with.
+#[derive(Debug, Clone)]
+pub struct ClaimHolder {
+    pub claim_id: String,
+    /// Owning session identity recorded by the coordinator.
+    pub node: Option<String>,
+    pub fence: i64,
+    pub expires_at: String,
+}
+
+impl std::fmt::Display for ClaimRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "claim.acquire rejected: {} ({})", self.code, self.reason)
+    }
+}
+
+impl ClaimRejection {
+    /// Bounded JSON shape shared by the HTTP service and MCP callers.
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "code": self.code,
+            "message": self.to_string(),
+            "reason": self.reason,
+            "observed_at_ms": self.observed_at_ms,
+            "current_fence": self.current_fence,
+            "current_epoch": self.current_epoch,
+            "expected_epoch": self.expected_epoch,
+            "work_state": self.work_state,
+            "holder": self.holder.as_ref().map(|holder| serde_json::json!({
+                "claim_id": holder.claim_id,
+                "node": holder.node,
+                "fence": holder.fence,
+                "expires_at": holder.expires_at,
+            })),
+            "retry_after_ms": self.retry_after_ms,
+        })
+    }
 }
 
 impl PgError {
@@ -377,5 +439,73 @@ impl PgError {
 
     pub fn is_missing_simulated_evidence_execution(&self) -> bool {
         matches!(self, Self::Protocol(message) if message == Self::MISSING_SIMULATED_EVIDENCE_EXECUTION)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rejection(
+        reason: &'static str,
+        holder: Option<ClaimHolder>,
+        retry: Option<i64>,
+    ) -> ClaimRejection {
+        ClaimRejection {
+            code: "ClaimHeld",
+            reason,
+            observed_at_ms: 1_760_000_000_000,
+            current_fence: 7,
+            current_epoch: "epoch-a".into(),
+            expected_epoch: Some("epoch-b".into()),
+            work_state: "claimed".into(),
+            holder,
+            retry_after_ms: retry,
+        }
+    }
+
+    #[test]
+    fn every_reason_is_machine_readable() {
+        for reason in [
+            "stale_fence",
+            "epoch_mismatch",
+            "lease_live",
+            "expired_intent",
+        ] {
+            let value = rejection(reason, None, None).to_value();
+            assert_eq!(value["reason"], reason);
+            assert_eq!(value["code"], "ClaimHeld");
+            assert!(value["observed_at_ms"].as_i64().is_some_and(|ms| ms > 0));
+            assert_eq!(value["current_fence"], 7);
+            assert_eq!(value["current_epoch"], "epoch-a");
+            assert_eq!(value["expected_epoch"], "epoch-b");
+            assert_eq!(value["work_state"], "claimed");
+            assert!(value["holder"].is_null());
+            assert!(value["retry_after_ms"].is_null());
+        }
+    }
+
+    #[test]
+    fn a_live_holder_is_named_with_expiry_and_retry() {
+        let holder = ClaimHolder {
+            claim_id: "claim-1".into(),
+            node: Some("session-1".into()),
+            fence: 7,
+            expires_at: "2026-10-17T16:30:00Z".into(),
+        };
+        let value = rejection("lease_live", Some(holder), Some(30_000)).to_value();
+        assert_eq!(value["holder"]["claim_id"], "claim-1");
+        assert_eq!(value["holder"]["node"], "session-1");
+        assert_eq!(value["holder"]["fence"], 7);
+        assert_eq!(value["holder"]["expires_at"], "2026-10-17T16:30:00Z");
+        assert_eq!(value["retry_after_ms"], 30_000);
+    }
+
+    #[test]
+    fn display_keeps_the_public_error_sentence() {
+        assert_eq!(
+            rejection("stale_fence", None, None).to_string(),
+            "claim.acquire rejected: ClaimHeld (stale_fence)"
+        );
     }
 }

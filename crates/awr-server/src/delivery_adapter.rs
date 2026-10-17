@@ -79,6 +79,17 @@ fn domain_error(error: PgError) -> LocalGitError {
         | PgError::SchemaIncompatible(_)
         | PgError::Workstream(_) => LocalGitError::PreconditionsChanged,
         PgError::ResourceConflict | PgError::ClaimHeld => LocalGitError::Contention,
+        // A descriptive claim refusal keeps the public code of the plain error it
+        // explains, so delivery classifies it exactly like that plain error.
+        PgError::ClaimRejected(rejection) => match rejection.code {
+            "ClaimHeld" | "ResourceConflict" => LocalGitError::Contention,
+            "PreconditionsChanged" | "EpochChanged" | "StaleFence" | "LeaseExpired" => {
+                LocalGitError::PreconditionsChanged
+            }
+            "Forbidden" | "ProjectNotAvailable" => LocalGitError::AuthorizationUnavailable,
+            "IdempotencyConflict" => LocalGitError::IdempotencyConflict,
+            _ => LocalGitError::StoreUnavailable,
+        },
         PgError::IdempotencyConflict => LocalGitError::IdempotencyConflict,
         PgError::BindingInvalid | PgError::Protocol(_) => LocalGitError::DomainRejected,
         _ => LocalGitError::StoreUnavailable,
@@ -276,6 +287,36 @@ mod publication_tests {
         assert_eq!(
             domain_error(PgError::Forbidden),
             LocalGitError::AuthorizationUnavailable
+        );
+    }
+
+    fn rejection(code: &'static str, reason: &'static str) -> PgError {
+        PgError::ClaimRejected(Box::new(awr_team_pg::ClaimRejection {
+            code,
+            reason,
+            observed_at_ms: 0,
+            current_fence: 3,
+            current_epoch: "epoch-a".into(),
+            expected_epoch: None,
+            work_state: "claimed".into(),
+            holder: None,
+            retry_after_ms: None,
+        }))
+    }
+
+    #[test]
+    fn claim_rejections_keep_their_public_code_and_stay_retryable_by_class() {
+        assert_eq!(
+            domain_error(rejection("ClaimHeld", "lease_live")),
+            LocalGitError::Contention
+        );
+        assert_eq!(
+            domain_error(rejection("PreconditionsChanged", "stale_fence")),
+            LocalGitError::PreconditionsChanged
+        );
+        assert_eq!(
+            domain_error(rejection("RecoveryBlocked", "epoch_mismatch")),
+            LocalGitError::StoreUnavailable
         );
     }
 

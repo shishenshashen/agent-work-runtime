@@ -591,12 +591,280 @@ fn make_locator(
 }
 
 pub fn resolve(
-    _loc: &EvidenceLocatorV1,
-    _local_root: &Path,
-    _io: &dyn LocatorIo,
-    _section: SectionCheck,
+    loc: &EvidenceLocatorV1,
+    local_root: &Path,
+    io: &dyn LocatorIo,
+    section: SectionCheck,
 ) -> ResolveReport {
-    unimplemented!("PR-2 contract skeleton: resolve is not implemented")
+    let mut stats = IoStats::default();
+    let finish = |outcome: ResolveOutcome, section: SectionStatus, stats: IoStats| ResolveReport {
+        outcome,
+        section,
+        io: stats,
+    };
+
+    // R0/R1：不可移植类别与不可用 relpath 在**任何 IO 之前**返回（IO==0 的载体）。
+    match loc.kind {
+        LocatorKind::ExternalAbsolute | LocatorKind::Opaque => {
+            return finish(
+                ResolveOutcome::Unportable(UnportableReason::NotPortable),
+                SectionStatus::NotEvaluated,
+                stats,
+            );
+        }
+        LocatorKind::ProjectRelative => {}
+    }
+    let relpath = match &loc.relpath {
+        Some(relpath) if !relpath.is_empty() => relpath,
+        _ => {
+            return finish(
+                ResolveOutcome::Unportable(UnportableReason::NotPortable),
+                SectionStatus::NotEvaluated,
+                stats,
+            );
+        }
+    };
+
+    // R2：防御性检查（normalize 已保证），仍零 IO。
+    if relpath.contains('\\')
+        || relpath.starts_with('/')
+        || relpath.split('/').any(|segment| segment == "..")
+    {
+        return finish(
+            ResolveOutcome::Unportable(UnportableReason::PathEscape),
+            SectionStatus::NotEvaluated,
+            stats,
+        );
+    }
+
+    // R3/R4：规范化全部走注入 IO，绝不探测真实磁盘。
+    let canonical_root = match io.canonicalize(local_root) {
+        Ok(path) => {
+            stats.canonicalize_calls += 1;
+            path
+        }
+        Err(_) => {
+            stats.canonicalize_calls += 1;
+            return finish(
+                ResolveOutcome::IoFailed {
+                    op: IoOp::Canonicalize,
+                },
+                SectionStatus::NotEvaluated,
+                stats,
+            );
+        }
+    };
+    let target = canonical_root.join(relpath);
+    let canonical_target = match io.canonicalize(&target) {
+        Ok(path) => {
+            stats.canonicalize_calls += 1;
+            path
+        }
+        Err(error) => {
+            stats.canonicalize_calls += 1;
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return finish(ResolveOutcome::Missing, SectionStatus::NotEvaluated, stats);
+            }
+            return finish(
+                ResolveOutcome::IoFailed {
+                    op: IoOp::Canonicalize,
+                },
+                SectionStatus::NotEvaluated,
+                stats,
+            );
+        }
+    };
+
+    // R5：符号链接逃逸 ⇒ PathEscape，且 hasher 一次都不调（hash_reads == 0）。
+    if !canonical_target.starts_with(&canonical_root) {
+        return finish(
+            ResolveOutcome::Unportable(UnportableReason::PathEscape),
+            SectionStatus::NotEvaluated,
+            stats,
+        );
+    }
+
+    // R6：存在性由注入 hasher 的 NotFound 表达，不用 `is_file()`。
+    let actual = match io.sha256_file(&canonical_target) {
+        Ok(value) => {
+            stats.hash_reads += 1;
+            value
+        }
+        Err(error) => {
+            stats.hash_reads += 1;
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return finish(ResolveOutcome::Missing, SectionStatus::NotEvaluated, stats);
+            }
+            return finish(
+                ResolveOutcome::IoFailed { op: IoOp::Hash },
+                SectionStatus::NotEvaluated,
+                stats,
+            );
+        }
+    };
+
+    // R7–R12：内容判定先于节判定；SectionDrift 蕴含内容 sha 相等。
+    match &loc.content_sha256 {
+        None => finish(ResolveOutcome::Unbound, SectionStatus::NotEvaluated, stats),
+        Some(expected) if expected == &actual => {
+            let (outcome, status) = match (&loc.section_expected, &section) {
+                (None, _) => (
+                    ResolveOutcome::Current {
+                        sha256: actual.clone(),
+                    },
+                    SectionStatus::NotBound,
+                ),
+                (Some(_), SectionCheck::Unavailable) => (
+                    ResolveOutcome::Current {
+                        sha256: actual.clone(),
+                    },
+                    SectionStatus::Unavailable,
+                ),
+                (Some(_), SectionCheck::Available { actual: None }) => (
+                    ResolveOutcome::Current {
+                        sha256: actual.clone(),
+                    },
+                    SectionStatus::Unavailable,
+                ),
+                (
+                    Some(expected_section),
+                    SectionCheck::Available {
+                        actual: Some(actual_section),
+                    },
+                ) => {
+                    if expected_section == actual_section {
+                        (
+                            ResolveOutcome::Current {
+                                sha256: actual.clone(),
+                            },
+                            SectionStatus::Compared { equal: true },
+                        )
+                    } else {
+                        (
+                            ResolveOutcome::SectionDrift {
+                                expected: Some(expected_section.clone()),
+                                actual: Some(actual_section.clone()),
+                            },
+                            SectionStatus::Compared { equal: false },
+                        )
+                    }
+                }
+            };
+            finish(outcome, status, stats)
+        }
+        Some(expected) => finish(
+            ResolveOutcome::ContentDrift {
+                expected: expected.clone(),
+                actual,
+            },
+            SectionStatus::NotEvaluated,
+            stats,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ⑨ PortableGroup 边界 — 组键四元 + 固定七级优先级 + 条数守恒
+// ---------------------------------------------------------------------------
+
+/// 组键四元：`(work_item.external_key, relpath, line, span)`。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct GroupKey {
+    pub work_item_external_key: String,
+    pub relpath: String,
+    pub line: Option<u32>,
+    pub span: Option<u32>,
+}
+
+/// 入组条件：`kind == ProjectRelative` 且 `relpath` 非空；其余进 `unportable`。
+pub fn group_key_for(work_item_external_key: &str, loc: &EvidenceLocatorV1) -> Option<GroupKey> {
+    if loc.kind != LocatorKind::ProjectRelative {
+        return None;
+    }
+    let relpath = loc.relpath.as_ref()?;
+    if relpath.is_empty() {
+        return None;
+    }
+    Some(GroupKey {
+        work_item_external_key: work_item_external_key.to_string(),
+        relpath: relpath.clone(),
+        line: loc.line,
+        span: loc.span,
+    })
+}
+
+/// 固定优先级（高 → 低）：`IoFailed > Unportable > SectionDrift > ContentDrift > Missing > Unbound > Current`。
+pub fn outcome_priority(outcome: &ResolveOutcome) -> u8 {
+    match outcome {
+        ResolveOutcome::IoFailed { .. } => 7,
+        ResolveOutcome::Unportable(_) => 6,
+        ResolveOutcome::SectionDrift { .. } => 5,
+        ResolveOutcome::ContentDrift { .. } => 4,
+        ResolveOutcome::Missing => 3,
+        ResolveOutcome::Unbound => 2,
+        ResolveOutcome::Current { .. } => 1,
+    }
+}
+
+pub struct GroupInput {
+    pub work_item_external_key: String,
+    pub evidence_id: Id,
+    pub locator: EvidenceLocatorV1,
+    pub outcome: ResolveOutcome,
+    pub section_check_unavailable: bool,
+}
+
+/// 纯函数分组：组内 outcome 取最高优先级（同优先级按 `evidence_id` 升序取首个）；
+/// 条数守恒：`Σ groups[].evidence_ids.len() + unportable.len() == inputs.len()`。
+pub fn group_records(inputs: &[GroupInput]) -> PortableReport {
+    let mut buckets: std::collections::BTreeMap<GroupKey, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut unportable: Vec<UnportableEntry> = Vec::new();
+
+    for (index, input) in inputs.iter().enumerate() {
+        match group_key_for(&input.work_item_external_key, &input.locator) {
+            Some(key) => buckets.entry(key).or_default().push(index),
+            None => unportable.push(UnportableEntry {
+                original: input.locator.original.clone(),
+                reason: UnportableReason::NotPortable,
+            }),
+        }
+    }
+
+    let groups = buckets
+        .into_iter()
+        .map(|(key, indexes)| {
+            let mut evidence_ids: Vec<Id> =
+                indexes.iter().map(|&i| inputs[i].evidence_id).collect();
+            evidence_ids.sort();
+
+            let mut worst = indexes[0];
+            for &index in &indexes[1..] {
+                let candidate = outcome_priority(&inputs[index].outcome);
+                let current = outcome_priority(&inputs[worst].outcome);
+                if candidate > current
+                    || (candidate == current
+                        && inputs[index].evidence_id < inputs[worst].evidence_id)
+                {
+                    worst = index;
+                }
+            }
+
+            PortableGroup {
+                relpath: key.relpath,
+                line: key.line,
+                span: key.span,
+                evidence_ids,
+                outcome: inputs[worst].outcome.clone(),
+                section_check_unavailable: indexes
+                    .iter()
+                    .any(|&i| inputs[i].section_check_unavailable),
+            }
+        })
+        .collect();
+
+    unportable.sort_by(|a, b| a.original.cmp(&b.original));
+    PortableReport { groups, unportable }
 }
 
 #[cfg(test)]
@@ -756,6 +1024,32 @@ mod tests {
         let relative = at(r"C:proj\src\a.md", r"C:\proj").expect("drive-relative");
         assert_eq!(relative.kind, LocatorKind::ProjectRelative);
         assert_eq!(relative.relpath.as_deref(), Some("C:proj/src/a.md"));
+    }
+
+    // C1 ordering guard: if scheme detection ran after shape/escape analysis, these
+    // would become relative paths and `http:../../etc/passwd` would underflow.
+    #[test]
+    fn c1_non_file_schemes_never_reach_escape() {
+        for locator in [
+            "http:../../etc/passwd",
+            "node:fs/promises",
+            "http://example.com/../../x",
+        ] {
+            let got = at(locator, "/home/alice/proj").expect("opaque is Ok");
+            assert_eq!(got.kind, LocatorKind::Opaque, "{locator}");
+            assert_eq!(got.relpath, None, "{locator}");
+            assert_eq!(got.original, locator, "{locator}");
+        }
+    }
+
+    // C2 ordering guard: lexical folding strips `\\?\` BEFORE shape/root analysis.
+    // Without that, the raw `\\?\C:` prefix would classify as UNC and the locator
+    // would be reported as ExternalAbsolute instead of ProjectRelative.
+    #[test]
+    fn c2_extended_prefix_folds_before_escape() {
+        let got = at(r"\\?\C:\a\..\a\b.md", r"C:\").expect("extended prefix");
+        assert_eq!(got.kind, LocatorKind::ProjectRelative);
+        assert_eq!(got.relpath.as_deref(), Some("a/b.md"));
     }
 
     // N1 — `original` is the untrimmed, byte-exact input.

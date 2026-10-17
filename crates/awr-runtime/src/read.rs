@@ -130,9 +130,6 @@ pub(crate) fn read_registered_file(
             "artifact exceeds {max_bytes} byte read limit"
         )));
     }
-    if locator.contains("://") {
-        return Err(Error::Unsupported("body reads currently support registered local paths; use the report locator for remote content".into()));
-    }
     let project = store.project(project)?;
     let root = project.root.canonicalize()?;
     if root != project.root {
@@ -140,12 +137,30 @@ pub(crate) fn read_registered_file(
             "project root moved since registration".into(),
         ));
     }
-    let path = if Path::new(locator).is_absolute() {
-        Path::new(locator).to_path_buf()
+    // Canonical `file://` locators go through the same authority check as source
+    // locators; other schemes stay unsupported for body reads, and bare paths keep
+    // the legacy resolution rule below so older evidence rows remain readable.
+    let parsed = if locator.starts_with("file://") {
+        let manifest = awr_source::Manifest::load(&root)?;
+        Some(awr_source::Locator::parse(&root, &manifest, locator)?)
     } else {
-        root.join(locator)
-    }
-    .canonicalize()?;
+        None
+    };
+    let path = match parsed {
+        Some(awr_source::Locator::File(path)) => path,
+        Some(awr_source::Locator::Git { .. }) => {
+            return Err(Error::Unsupported("body reads currently support registered local paths; use the report locator for remote content".into()));
+        }
+        None if locator.contains("://") => {
+            return Err(Error::Unsupported("body reads currently support registered local paths; use the report locator for remote content".into()));
+        }
+        None => if Path::new(locator).is_absolute() {
+            Path::new(locator).to_path_buf()
+        } else {
+            root.join(locator)
+        }
+        .canonicalize()?,
+    };
     let allowed = path.starts_with(&root)
         || (root.join(".awr/project.toml").exists()
             && awr_source::Manifest::load(&root)?

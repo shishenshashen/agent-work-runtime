@@ -166,6 +166,13 @@ fn relative(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// RFC 3986 scheme: an ASCII letter followed by letters, digits, `+`, `.` or `-`.
+fn is_scheme(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+}
+
 impl Locator {
     /// Registration identity keeps a Git ref stable while snapshot locators bind immutable commits.
     pub fn identity(&self) -> Result<String> {
@@ -197,6 +204,32 @@ impl Locator {
             .locator
             .as_deref()
             .ok_or_else(|| Error::InvalidInput("missing locator".into()))?;
+        // A manifest locator keeps the original strict rule: only the canonical
+        // `file://` URL and the pinned `git://` form are accepted, so no manifest
+        // that parsed before changes meaning now that evidence locators are also
+        // normalized. Bare paths stay the `path` field's job.
+        if value.starts_with("file://") || value.starts_with("git://") {
+            return Self::parse(root, manifest, value);
+        }
+        Err(Error::Unsupported(
+            "V1 supports file:// and git:// sources".into(),
+        ))
+    }
+
+    /// Parse one locator string through the single path authority.
+    ///
+    /// Accepted forms are the canonical `file://` URL produced by
+    /// [`Locator::identity`], a pinned
+    /// `git://<revision>:<project-relative-path>` locator, and a bare filesystem
+    /// path (the form `awr evidence add` has always accepted). `file://` URLs and
+    /// bare paths are canonicalized and must stay inside the project root or a
+    /// configured authorized root; Git paths must stay project-relative. Any other
+    /// scheme is reported as unsupported before the filesystem is touched, so a
+    /// remote reference never costs a read.
+    pub fn parse(root: &Path, manifest: &Manifest, value: &str) -> Result<Self> {
+        if value.trim().is_empty() {
+            return Err(Error::InvalidInput("locator must not be empty".into()));
+        }
         if value.starts_with("file://") {
             let url = Url::parse(value).map_err(|e| Error::InvalidInput(e.to_string()))?;
             if url.query().is_some() || url.fragment().is_some() {
@@ -228,10 +261,45 @@ impl Locator {
                 path,
             });
         }
-        Err(Error::Unsupported(
-            "V1 supports file:// and git:// sources".into(),
-        ))
+        if value.contains("://") {
+            return Err(Error::Unsupported(
+                "V1 supports file:// and git:// sources".into(),
+            ));
+        }
+        // An URI-scheme prefix such as `node:`, `s3:` or a `file:`/`git:` spelling
+        // missing its `//` is not a filesystem path. The scheme must be at least two
+        // characters so a Windows drive letter (`C:\...`) keeps its bare-path
+        // meaning. This gate runs before the filesystem is touched, so a remote
+        // reference never costs a read.
+        if let Some((scheme, _)) = value.split_once(':')
+            && scheme.len() >= 2
+            && is_scheme(scheme)
+        {
+            return Err(Error::Unsupported(format!(
+                "unsupported locator scheme {scheme}: V1 supports file:// and git:// sources"
+            )));
+        }
+        Self::file(root, manifest, Path::new(value))
     }
+
+    /// Canonical registration form for an evidence locator.
+    ///
+    /// Resolvable locators are stored as their canonical identity, so every writer
+    /// records one shape. A remote or unavailable reference keeps the caller's
+    /// spelling, matching the read path's existing treatment; whether registration
+    /// should reject those is a separate question and is deliberately unchanged.
+    pub fn normalize_for_registration(
+        root: &Path,
+        manifest: &Manifest,
+        value: &str,
+    ) -> Result<String> {
+        match Self::parse(root, manifest, value) {
+            Ok(locator) => locator.identity(),
+            Err(Error::Unsupported(_)) | Err(Error::SourceUnavailable(_)) => Ok(value.to_owned()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn file(root: &Path, manifest: &Manifest, path: &Path) -> Result<Self> {
         if path.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(Error::RuleViolation(
@@ -357,4 +425,181 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
         ));
     }
     Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MANIFEST: &str = "[project]\nname = 'P'\n\n[[sources]]\ndomain = 'decisions'\nrole = 'supporting'\npath = 'decisions'\nadapter = 'markdown-directory-v1'\n";
+    const GIT_REV: &str = "4bdeb5a384d6321b6b0dc22f69dfa71f283386bc";
+
+    fn manifest() -> Manifest {
+        Manifest::parse(MANIFEST).expect("test manifest")
+    }
+
+    fn missing_root() -> PathBuf {
+        std::env::temp_dir().join("awr-locator-unit-missing-root-do-not-create")
+    }
+
+    fn snapshot(locator: &str, bytes: &[u8], digest: &str) -> SourceSnapshot {
+        SourceSnapshot {
+            locator: locator.into(),
+            fingerprint: digest.into(),
+            bytes: bytes.to_vec(),
+            content_review: None,
+        }
+    }
+
+    #[test]
+    fn git_fingerprint_binds_resolved_locator_and_bytes() {
+        let locator = format!("git://{GIT_REV}:docs/x.md");
+        let bytes = b"hello\n";
+        let mut hash = Sha256::new();
+        hash.update(locator.as_bytes());
+        hash.update([0]);
+        hash.update(bytes);
+        let expected = format!("sha256:{:x}", hash.finalize());
+        assert!(snapshot(&locator, bytes, &expected).verify_fingerprint());
+        // A different pinned commit is a different source even with equal bytes.
+        let other = format!("git://{}:docs/x.md", "0".repeat(40));
+        assert!(!snapshot(&other, bytes, &expected).verify_fingerprint());
+        // The same locator with different bytes is not the reviewed snapshot.
+        assert!(!snapshot(&locator, b"hello!\n", &expected).verify_fingerprint());
+    }
+
+    #[test]
+    fn malformed_git_locators_fail_closed() {
+        let bytes = b"hello\n";
+        for locator in [
+            format!("git://{GIT_REV}docs/x.md"),
+            "git://abc:docs/x.md".to_string(),
+            format!("git://{GIT_REV}:../x.md"),
+            format!("git://{GIT_REV}:/abs.md"),
+        ] {
+            assert!(
+                !snapshot(&locator, bytes, &fingerprint(bytes)).verify_fingerprint(),
+                "{locator}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_fingerprint_is_sha256_of_bytes() {
+        let bytes = b"hello\n";
+        let locator = "file:///C:/proj/reports/a.md";
+        let expected = "sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03";
+        assert_eq!(fingerprint(bytes), expected);
+        assert!(snapshot(locator, bytes, expected).verify_fingerprint());
+        assert!(!snapshot(locator, b"hello", expected).verify_fingerprint());
+    }
+
+    #[test]
+    fn unknown_scheme_is_not_a_fingerprint_authority() {
+        for locator in ["https://example.com/x", "node:events", "project://p/a.md"] {
+            assert!(
+                !snapshot(locator, b"hello\n", "sha256:00").verify_fingerprint(),
+                "{locator}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_utf8_snapshot_text_is_invalid_input() {
+        let bytes = [0xff, 0xfe, 0x00];
+        let locator = "file:///C:/proj/reports/a.bin";
+        let digest = fingerprint(&bytes);
+        assert!(matches!(
+            snapshot(locator, &bytes, &digest).text(),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn identity_shapes_are_canonical() {
+        let absolute = std::env::temp_dir().join("awr-locator-identity/reports/a.md");
+        let file_identity = Locator::File(absolute).identity().expect("file identity");
+        assert!(file_identity.starts_with("file://"), "{file_identity}");
+        assert!(file_identity.ends_with("/reports/a.md"), "{file_identity}");
+        let git = Locator::Git {
+            revision: GIT_REV.into(),
+            path: PathBuf::from("docs/x.md"),
+        };
+        assert_eq!(
+            git.identity().expect("git identity"),
+            format!("git://{GIT_REV}:docs/x.md")
+        );
+        let escape = Locator::Git {
+            revision: GIT_REV.into(),
+            path: PathBuf::from("../x.md"),
+        };
+        assert!(matches!(escape.identity(), Err(Error::RuleViolation(_))));
+    }
+
+    #[test]
+    fn unsupported_schemes_are_rejected_before_the_filesystem() {
+        // The root does not exist: touching it would surface SourceUnavailable.
+        for value in ["node:events", "s3:bucket/key", "https://example.com/x"] {
+            assert!(
+                matches!(
+                    Locator::parse(&missing_root(), &manifest(), value),
+                    Err(Error::Unsupported(_))
+                ),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_drive_letter_is_not_a_scheme() {
+        // One-letter schemes are not schemes, so `C:\x` reaches the path branch.
+        assert!(matches!(
+            Locator::parse(&missing_root(), &manifest(), r"C:\x"),
+            Err(Error::SourceUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn file_and_git_prefixes_without_slashes_are_unsupported() {
+        // A bare path is the only path spelling. A scheme spelling that lost its
+        // `//` is a protocol reference, never a relative file name.
+        for value in ["file:reports/a.md", "git:reports/a.md"] {
+            assert!(
+                matches!(
+                    Locator::parse(&missing_root(), &manifest(), value),
+                    Err(Error::Unsupported(_))
+                ),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn registration_normalization_keeps_unparsable_references_verbatim() {
+        let manifest = manifest();
+        for value in ["node:events", "https://example.com/x"] {
+            assert_eq!(
+                Locator::normalize_for_registration(&missing_root(), &manifest, value).unwrap(),
+                value
+            );
+        }
+        assert!(matches!(
+            Locator::normalize_for_registration(&missing_root(), &manifest, "  "),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn manifest_locators_stay_scheme_qualified() {
+        let spec = concat!(
+            "[project]\nname = 'P'\n\n[[sources]]\ndomain = 'decisions'\n",
+            "role = 'supporting'\nlocator = 'reports/a.md'\n",
+            "adapter = 'markdown-directory-v1'\n"
+        );
+        let manifest = Manifest::parse(spec).expect("spec manifest");
+        assert!(matches!(
+            Locator::from_spec(&missing_root(), &manifest, &manifest.sources[0]),
+            Err(Error::Unsupported(_))
+        ));
+    }
 }

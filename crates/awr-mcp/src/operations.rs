@@ -683,23 +683,27 @@ fn append_event(root: &Path, args: EventArgs) -> Result<CallToolResult> {
 fn evidence(root: &Path, args: EvidenceArgs) -> Result<CallToolResult> {
     let (mut store, project) = write_project(root, args.expected_revision)?;
     let branch_id = branch(&store, &project, args.branch.as_deref())?;
-    let (evidence, event) = Runtime::attach(&mut store, project.id)?.record_evidence(
-        args.expected_revision,
-        EvidenceDraft {
-            external_key: args.external_key,
-            work_item_key: args.work,
-            evidence_type: args.evidence_type,
-            level: args.level,
-            summary: args.summary,
-            locator: args.locator,
-            sha256: args.sha256,
-            source_sha: args.source_sha,
-            command: args.command,
-            scope: args.scope,
-            branch_id,
-            verified_at: args.verified_at,
-        },
-    )?;
+    let mut draft = EvidenceDraft {
+        external_key: args.external_key,
+        work_item_key: args.work,
+        evidence_type: args.evidence_type,
+        level: args.level,
+        summary: args.summary,
+        locator: args.locator,
+        sha256: args.sha256,
+        source_sha: args.source_sha,
+        command: args.command,
+        scope: args.scope,
+        branch_id,
+        verified_at: args.verified_at,
+    };
+    // The CLI write path calls the same entry point, so a registered locator has
+    // one canonical shape whichever surface recorded it.
+    let manifest = awr_source::Manifest::load(&project.root)?;
+    draft.locator =
+        awr_source::Locator::normalize_for_registration(&project.root, &manifest, &draft.locator)?;
+    let (evidence, event) =
+        Runtime::attach(&mut store, project.id)?.record_evidence(args.expected_revision, draft)?;
     Ok(CallToolResult::structured(
         json!({"ok":true,"project_revision":event.project_revision,"evidence":evidence,"event_id":event.id,"validation_basis":"caller_supplied_bindings","freshness_basis":"source_refresh","source_refresh_performed":true}),
     ))

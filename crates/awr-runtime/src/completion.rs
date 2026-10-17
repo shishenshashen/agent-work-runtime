@@ -60,12 +60,27 @@ pub(crate) fn verify_completion_proof(
     let (target, _, _) = inspect_mutation_source(root, &source, patch)?;
     let mut reports = BTreeMap::new();
     for evidence in &binding.evidence {
-        if evidence.locator.contains("://") {
+        // Rows recorded after locator normalization carry a canonical `file://`
+        // locator; resolve it through the same authority. Legacy bare paths keep
+        // the original rule, and remote references stay unsupported report bodies.
+        let path = if evidence.locator.starts_with("file://") {
+            let manifest = awr_source::Manifest::load(root)?;
+            match awr_source::Locator::parse(root, &manifest, &evidence.locator)? {
+                Locator::File(path) => path,
+                Locator::Git { .. } => {
+                    return Err(Error::Unsupported(
+                        "completion requires a registered local report file".into(),
+                    ));
+                }
+            }
+        } else if evidence.locator.contains("://") {
             return Err(Error::Unsupported(
                 "completion requires a registered local report file".into(),
             ));
+        } else {
+            root.join(&evidence.locator)
         }
-        let path = root.join(&evidence.locator).canonicalize()?;
+        .canonicalize()?;
         if matches!(&target,Locator::File(p) if p==&path)
             || (path.starts_with(root.join(".awr"))
                 && !path.starts_with(root.join(".awr/artifacts")))

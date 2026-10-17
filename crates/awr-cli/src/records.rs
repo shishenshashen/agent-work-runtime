@@ -175,6 +175,14 @@ pub fn evidence(root: &Path, command: &EvidenceCommand, json_output: bool) -> Re
             if !declared_branch {
                 draft.branch_id = db.project.current_branch_id;
             }
+            // Store one canonical shape whichever spelling the caller used. The MCP
+            // write path calls the same entry point, so both writers agree.
+            let manifest = awr_source::Manifest::load(&db.project.root)?;
+            draft.locator = awr_source::Locator::normalize_for_registration(
+                &db.project.root,
+                &manifest,
+                &draft.locator,
+            )?;
             let (item, event) = Runtime::attach(&mut db.store, project)?
                 .record_evidence(*expected_revision, draft)?;
             let mut value = db.metadata(event.project_revision);

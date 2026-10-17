@@ -1,7 +1,10 @@
 use crate::{REGISTERED_CONTENT_READ_CAP, Runtime};
 use awr_core::*;
 use sha2::{Digest, Sha256};
-use std::{io::Read, path::Path};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 impl Runtime<'_> {
     /// Load current trusted policy before calling. The selected scope authorizes
@@ -112,6 +115,37 @@ impl Runtime<'_> {
     }
 }
 
+/// One resolved form for every accepted evidence-locator spelling.
+///
+/// The locator authority decides which file a string names, so currency decisions
+/// and the recorded-byte check compare the canonical path and the bytes, never the
+/// recorded text: `file://<absolute>`, the bare absolute path and a project-relative
+/// path with redundant `.` segments all resolve to the same file. Grouping elsewhere
+/// still keys on the recorded string; this helper never rewrites a row.
+///
+/// `None` means the spelling does not name a registered local file (a `git://`
+/// reference or any other scheme, remote or not); each caller keeps its own refusal.
+pub(crate) fn resolve_registered_locator(root: &Path, locator: &str) -> Result<Option<PathBuf>> {
+    if locator.starts_with("file://") {
+        let manifest = awr_source::Manifest::load(root)?;
+        return match awr_source::Locator::parse(root, &manifest, locator)? {
+            awr_source::Locator::File(path) => Ok(Some(path)),
+            awr_source::Locator::Git { .. } => Ok(None),
+        };
+    }
+    if locator.contains("://") {
+        return Ok(None);
+    }
+    Ok(Some(
+        if Path::new(locator).is_absolute() {
+            Path::new(locator).to_path_buf()
+        } else {
+            root.join(locator)
+        }
+        .canonicalize()?,
+    ))
+}
+
 pub(crate) fn read_registered_file(
     store: &awr_store::Store,
     project: Id,
@@ -137,30 +171,11 @@ pub(crate) fn read_registered_file(
             "project root moved since registration".into(),
         ));
     }
-    // Canonical `file://` locators go through the same authority check as source
-    // locators; other schemes stay unsupported for body reads, and bare paths keep
-    // the legacy resolution rule below so older evidence rows remain readable.
-    let parsed = if locator.starts_with("file://") {
-        let manifest = awr_source::Manifest::load(&root)?;
-        Some(awr_source::Locator::parse(&root, &manifest, locator)?)
-    } else {
-        None
-    };
-    let path = match parsed {
-        Some(awr_source::Locator::File(path)) => path,
-        Some(awr_source::Locator::Git { .. }) => {
-            return Err(Error::Unsupported("body reads currently support registered local paths; use the report locator for remote content".into()));
-        }
-        None if locator.contains("://") => {
-            return Err(Error::Unsupported("body reads currently support registered local paths; use the report locator for remote content".into()));
-        }
-        None => if Path::new(locator).is_absolute() {
-            Path::new(locator).to_path_buf()
-        } else {
-            root.join(locator)
-        }
-        .canonicalize()?,
-    };
+    // One resolved form for every accepted spelling; the byte check below still
+    // binds the bytes, so an alias cannot stand in for different content.
+    let path = resolve_registered_locator(&root, locator)?.ok_or_else(|| {
+        Error::Unsupported("body reads currently support registered local paths; use the report locator for remote content".into())
+    })?;
     let allowed = path.starts_with(&root)
         || (root.join(".awr/project.toml").exists()
             && awr_source::Manifest::load(&root)?
@@ -224,4 +239,91 @@ pub(crate) fn read_registered_file(
     }
     ensure_public_bytes(&bytes)?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{env, fs};
+
+    const MANIFEST: &str = "[project]\nname = 'P'\n\n[[sources]]\ndomain = 'decisions'\nrole = 'supporting'\npath = 'decisions'\nadapter = 'markdown-directory-v1'\n";
+
+    fn scratch(tag: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!("awr-spelling-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".awr")).expect("scratch runtime dir");
+        fs::write(root.join(".awr/project.toml"), MANIFEST).expect("scratch manifest");
+        fs::create_dir_all(root.join("reports")).expect("scratch reports");
+        fs::write(root.join("reports/a.md"), b"hello\n").expect("scratch report");
+        root.canonicalize().expect("canonical scratch root")
+    }
+
+    #[test]
+    fn every_spelling_of_one_file_resolves_to_the_same_path() {
+        let root = scratch("same");
+        let canonical = root.join("reports/a.md").canonicalize().unwrap();
+        let identity = awr_source::Locator::File(canonical.clone())
+            .identity()
+            .expect("file identity");
+        let absolute = root
+            .join("reports/a.md")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let resolved: Vec<PathBuf> = [identity, absolute, "reports/./a.md".into()]
+            .iter()
+            .map(|locator| {
+                resolve_registered_locator(&root, locator)
+                    .expect("spelling resolves")
+                    .expect("local file")
+            })
+            .collect();
+        assert!(
+            resolved.iter().all(|path| path == &canonical),
+            "{resolved:?}"
+        );
+    }
+
+    #[test]
+    fn different_files_are_not_equivalent_even_with_equal_bytes() {
+        let left = scratch("left");
+        let right = scratch("right");
+        // Both roots hold `reports/a.md` with identical bytes; a resolved path is
+        // still per-project, so equal content can never make two files equivalent.
+        let left_path = resolve_registered_locator(&left, "reports/a.md")
+            .unwrap()
+            .expect("local file");
+        let right_path = resolve_registered_locator(&right, "reports/a.md")
+            .unwrap()
+            .expect("local file");
+        assert_ne!(left_path, right_path);
+        assert_eq!(left_path, left.join("reports/a.md").canonicalize().unwrap());
+    }
+
+    #[test]
+    fn remote_and_git_spellings_never_resolve_to_a_local_report() {
+        let root = scratch("remote");
+        for locator in [
+            "git://4bdeb5a384d6321b6b0dc22f69dfa71f283386bc:docs/x.md",
+            "https://example.com/x",
+        ] {
+            assert!(
+                resolve_registered_locator(&root, locator)
+                    .expect("a remote reference is not an error")
+                    .is_none(),
+                "{locator}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scheme_like_bare_token_keeps_the_legacy_path_branch() {
+        // `node:events` never carried a `file://` spelling, so it keeps the original
+        // rule: a relative path that fails as missing, not a remote reference.
+        let root = scratch("scheme");
+        assert!(matches!(
+            resolve_registered_locator(&root, "node:events"),
+            Err(Error::Io(_))
+        ));
+    }
 }

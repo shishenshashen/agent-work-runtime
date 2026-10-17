@@ -177,3 +177,104 @@ fn project_locator_rejects_an_authority_and_traversal() {
         );
     }
 }
+
+fn run_git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .output()
+        .expect("git must run");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn git_repo(tag: &str) -> (PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!(
+        "awr-project-locator-git-{tag}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    run_git(&dir, &["init", "-q"]);
+    fs::write(dir.join("README.md"), b"hello\n").unwrap();
+    run_git(&dir, &["add", "README.md"]);
+    run_git(
+        &dir,
+        &[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    let commit = run_git(&dir, &["rev-parse", "HEAD"]);
+    (dir.canonicalize().unwrap(), commit)
+}
+
+#[test]
+fn git_suffix_is_stripped_before_the_object_is_built_but_not_after() {
+    let (root, commit) = git_repo("suffix");
+    let manifest = manifest();
+    let spec = format!("git://{commit}:README.md#L12-L14");
+
+    // The single parse entry strips the selector, so the object is README.md.
+    let parsed = Locator::parse(&root, &manifest, &spec).unwrap();
+    assert_eq!(
+        parsed.identity().unwrap(),
+        format!("git://{commit}:README.md")
+    );
+    let snapshot = parsed.read(&root, 4096).unwrap();
+    assert_eq!(snapshot.locator, format!("git://{commit}:README.md"));
+    assert_eq!(snapshot.bytes, b"hello\n");
+
+    // Without that strip the suffixed path reaches `git cat-file` and fails as
+    // an unresolved object, which is why the strip cannot live anywhere else.
+    let raw = Locator::Git {
+        revision: commit,
+        path: PathBuf::from("README.md#L12-L14"),
+    };
+    let error = raw.read(&root, 4096).unwrap_err();
+    assert!(matches!(error, Error::SourceUnavailable(_)), "{error}");
+}
+
+#[test]
+fn fingerprint_verification_does_not_strip_a_suffix() {
+    let commit = "c".repeat(40);
+    let bytes = b"hello\n";
+    let suffixed = format!("git://{commit}:docs/x.md#L1-L2");
+    let stripped = format!("git://{commit}:docs/x.md");
+
+    // A fingerprint over the stripped locator must not verify a suffixed one.
+    let over_stripped = SourceSnapshot {
+        locator: suffixed.clone(),
+        fingerprint: git_fingerprint(&stripped, bytes),
+        bytes: bytes.to_vec(),
+        content_review: None,
+    };
+    assert!(
+        !over_stripped.verify_fingerprint(),
+        "verify_fingerprint must not strip the selector"
+    );
+
+    // It hashes whatever string the snapshot carries, so it cannot be the gate.
+    let over_suffixed = SourceSnapshot {
+        locator: suffixed.clone(),
+        fingerprint: git_fingerprint(&suffixed, bytes),
+        bytes: bytes.to_vec(),
+        content_review: None,
+    };
+    assert!(
+        over_suffixed.verify_fingerprint(),
+        "verify_fingerprint hashes the retained string verbatim"
+    );
+}

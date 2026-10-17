@@ -441,41 +441,6 @@ pub fn normalize(
     // N2 runs before anything else so `x.md#L12` and `C:/x#L3` both work.
     let (line, span, without_suffix) = split_line_suffix(trimmed);
 
-    // ORDER DEMO (RED): boundary/placement judgement with host `Path` semantics,
-    // BEFORE scheme detection (C1) and lexical folding (C2). Deliberately the wrong
-    // order; the next commit deletes this block and restores the contract order
-    // (scheme -> file-URI decode -> shape -> fold -> placement).
-    {
-        let raw = Path::new(trimmed);
-        let (kind, relpath) = if raw.is_absolute() {
-            match raw.strip_prefix(project_root) {
-                Ok(rel) if !rel.as_os_str().is_empty() => (
-                    LocatorKind::ProjectRelative,
-                    Some(rel.to_string_lossy().replace('\\', "/")),
-                ),
-                _ => (LocatorKind::ExternalAbsolute, None),
-            }
-        } else {
-            match project_root.join(raw).strip_prefix(project_root) {
-                Ok(rel) if !rel.as_os_str().is_empty() => (
-                    LocatorKind::ProjectRelative,
-                    Some(rel.to_string_lossy().replace('\\', "/")),
-                ),
-                _ => (LocatorKind::ExternalAbsolute, None),
-            }
-        };
-        return Ok(make_locator(
-            kind,
-            relpath,
-            line,
-            span,
-            content_sha256,
-            section_expected,
-            origin_hint,
-            original,
-        ));
-    }
-
     // N6: the root is normalised with the same string rules; it must be absolute
     // and must not underflow.
     let root_str = project_root.to_str().ok_or(UnportableReason::NotPortable)?;
@@ -626,12 +591,280 @@ fn make_locator(
 }
 
 pub fn resolve(
-    _loc: &EvidenceLocatorV1,
-    _local_root: &Path,
-    _io: &dyn LocatorIo,
-    _section: SectionCheck,
+    loc: &EvidenceLocatorV1,
+    local_root: &Path,
+    io: &dyn LocatorIo,
+    section: SectionCheck,
 ) -> ResolveReport {
-    unimplemented!("PR-2 contract skeleton: resolve is not implemented")
+    let mut stats = IoStats::default();
+    let finish = |outcome: ResolveOutcome, section: SectionStatus, stats: IoStats| ResolveReport {
+        outcome,
+        section,
+        io: stats,
+    };
+
+    // R0/R1: non-portable kinds and unusable relpaths return before any IO.
+    match loc.kind {
+        LocatorKind::ExternalAbsolute | LocatorKind::Opaque => {
+            return finish(
+                ResolveOutcome::Unportable(UnportableReason::NotPortable),
+                SectionStatus::NotEvaluated,
+                stats,
+            );
+        }
+        LocatorKind::ProjectRelative => {}
+    }
+    let relpath = match &loc.relpath {
+        Some(relpath) if !relpath.is_empty() => relpath,
+        _ => {
+            return finish(
+                ResolveOutcome::Unportable(UnportableReason::NotPortable),
+                SectionStatus::NotEvaluated,
+                stats,
+            );
+        }
+    };
+
+    // R2: defensive checks (normalize already guarantees these), still zero IO.
+    if relpath.contains('\\')
+        || relpath.starts_with('/')
+        || relpath.split('/').any(|segment| segment == "..")
+    {
+        return finish(
+            ResolveOutcome::Unportable(UnportableReason::PathEscape),
+            SectionStatus::NotEvaluated,
+            stats,
+        );
+    }
+
+    // R3/R4: canonicalize only through the injected IO.
+    let canonical_root = match io.canonicalize(local_root) {
+        Ok(path) => {
+            stats.canonicalize_calls += 1;
+            path
+        }
+        Err(_) => {
+            stats.canonicalize_calls += 1;
+            return finish(
+                ResolveOutcome::IoFailed {
+                    op: IoOp::Canonicalize,
+                },
+                SectionStatus::NotEvaluated,
+                stats,
+            );
+        }
+    };
+    let target = canonical_root.join(relpath);
+    let canonical_target = match io.canonicalize(&target) {
+        Ok(path) => {
+            stats.canonicalize_calls += 1;
+            path
+        }
+        Err(error) => {
+            stats.canonicalize_calls += 1;
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return finish(ResolveOutcome::Missing, SectionStatus::NotEvaluated, stats);
+            }
+            return finish(
+                ResolveOutcome::IoFailed {
+                    op: IoOp::Canonicalize,
+                },
+                SectionStatus::NotEvaluated,
+                stats,
+            );
+        }
+    };
+
+    // R5: a symlink resolving outside the root is a PathEscape, with hash_reads == 0.
+    if !canonical_target.starts_with(&canonical_root) {
+        return finish(
+            ResolveOutcome::Unportable(UnportableReason::PathEscape),
+            SectionStatus::NotEvaluated,
+            stats,
+        );
+    }
+
+    // R6: existence comes from the injected hasher, never from `is_file()`.
+    let actual = match io.sha256_file(&canonical_target) {
+        Ok(value) => {
+            stats.hash_reads += 1;
+            value
+        }
+        Err(error) => {
+            stats.hash_reads += 1;
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return finish(ResolveOutcome::Missing, SectionStatus::NotEvaluated, stats);
+            }
+            return finish(
+                ResolveOutcome::IoFailed { op: IoOp::Hash },
+                SectionStatus::NotEvaluated,
+                stats,
+            );
+        }
+    };
+
+    // R7-R12: content first, section only when the content matches.
+    match &loc.content_sha256 {
+        None => finish(ResolveOutcome::Unbound, SectionStatus::NotEvaluated, stats),
+        Some(expected) if expected == &actual => {
+            let (outcome, status) = match (&loc.section_expected, &section) {
+                (None, _) => (
+                    ResolveOutcome::Current {
+                        sha256: actual.clone(),
+                    },
+                    SectionStatus::NotBound,
+                ),
+                (Some(_), SectionCheck::Unavailable) => (
+                    ResolveOutcome::Current {
+                        sha256: actual.clone(),
+                    },
+                    SectionStatus::Unavailable,
+                ),
+                (Some(_), SectionCheck::Available { actual: None }) => (
+                    ResolveOutcome::Current {
+                        sha256: actual.clone(),
+                    },
+                    SectionStatus::Unavailable,
+                ),
+                (
+                    Some(expected_section),
+                    SectionCheck::Available {
+                        actual: Some(actual_section),
+                    },
+                ) => {
+                    if expected_section == actual_section {
+                        (
+                            ResolveOutcome::Current {
+                                sha256: actual.clone(),
+                            },
+                            SectionStatus::Compared { equal: true },
+                        )
+                    } else {
+                        (
+                            ResolveOutcome::SectionDrift {
+                                expected: Some(expected_section.clone()),
+                                actual: Some(actual_section.clone()),
+                            },
+                            SectionStatus::Compared { equal: false },
+                        )
+                    }
+                }
+            };
+            finish(outcome, status, stats)
+        }
+        Some(expected) => finish(
+            ResolveOutcome::ContentDrift {
+                expected: expected.clone(),
+                actual,
+            },
+            SectionStatus::NotEvaluated,
+            stats,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ⑨ PortableGroup boundary: four-part group key + fixed seven-level priority.
+// ---------------------------------------------------------------------------
+
+/// Four-part group key: `(work_item.external_key, relpath, line, span)`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct GroupKey {
+    pub work_item_external_key: String,
+    pub relpath: String,
+    pub line: Option<u32>,
+    pub span: Option<u32>,
+}
+
+/// A record joins a group only when `kind == ProjectRelative` and `relpath` is non-empty.
+pub fn group_key_for(work_item_external_key: &str, loc: &EvidenceLocatorV1) -> Option<GroupKey> {
+    if loc.kind != LocatorKind::ProjectRelative {
+        return None;
+    }
+    let relpath = loc.relpath.as_ref()?;
+    if relpath.is_empty() {
+        return None;
+    }
+    Some(GroupKey {
+        work_item_external_key: work_item_external_key.to_string(),
+        relpath: relpath.clone(),
+        line: loc.line,
+        span: loc.span,
+    })
+}
+
+/// Fixed priority (high to low): `IoFailed > Unportable > SectionDrift > ContentDrift > Missing > Unbound > Current`.
+pub fn outcome_priority(outcome: &ResolveOutcome) -> u8 {
+    match outcome {
+        ResolveOutcome::IoFailed { .. } => 7,
+        ResolveOutcome::Unportable(_) => 6,
+        ResolveOutcome::SectionDrift { .. } => 5,
+        ResolveOutcome::ContentDrift { .. } => 4,
+        ResolveOutcome::Missing => 3,
+        ResolveOutcome::Unbound => 2,
+        ResolveOutcome::Current { .. } => 1,
+    }
+}
+
+pub struct GroupInput {
+    pub work_item_external_key: String,
+    pub evidence_id: Id,
+    pub locator: EvidenceLocatorV1,
+    pub outcome: ResolveOutcome,
+    pub section_check_unavailable: bool,
+}
+
+/// Pure grouping: the group outcome takes the highest priority; ties break on
+/// ascending `evidence_id`. Conservation: `sum(group ids) + unportable == inputs`.
+pub fn group_records(inputs: &[GroupInput]) -> PortableReport {
+    let mut buckets: std::collections::BTreeMap<GroupKey, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut unportable: Vec<UnportableEntry> = Vec::new();
+
+    for (index, input) in inputs.iter().enumerate() {
+        match group_key_for(&input.work_item_external_key, &input.locator) {
+            Some(key) => buckets.entry(key).or_default().push(index),
+            None => unportable.push(UnportableEntry {
+                original: input.locator.original.clone(),
+                reason: UnportableReason::NotPortable,
+            }),
+        }
+    }
+
+    let groups = buckets
+        .into_iter()
+        .map(|(key, indexes)| {
+            let mut evidence_ids: Vec<Id> =
+                indexes.iter().map(|&i| inputs[i].evidence_id).collect();
+            evidence_ids.sort();
+
+            let mut worst = indexes[0];
+            for &index in &indexes[1..] {
+                let candidate = outcome_priority(&inputs[index].outcome);
+                let current = outcome_priority(&inputs[worst].outcome);
+                if candidate > current
+                    || (candidate == current
+                        && inputs[index].evidence_id < inputs[worst].evidence_id)
+                {
+                    worst = index;
+                }
+            }
+
+            PortableGroup {
+                relpath: key.relpath,
+                line: key.line,
+                span: key.span,
+                evidence_ids,
+                outcome: inputs[worst].outcome.clone(),
+                section_check_unavailable: indexes
+                    .iter()
+                    .any(|&i| inputs[i].section_check_unavailable),
+            }
+        })
+        .collect();
+
+    unportable.sort_by(|a, b| a.original.cmp(&b.original));
+    PortableReport { groups, unportable }
 }
 
 #[cfg(test)]mod tests {
@@ -827,5 +1060,273 @@ pub fn resolve(
         assert_eq!(got.content_sha256, Some("a".repeat(64)));
         assert_eq!(got.section_expected.as_deref(), Some("section-a"));
         assert_eq!(got.origin_hint.as_deref(), Some("device-x"));
+    }
+
+    // ---- gate 2 item 3: injected IO + self-written `IoStats` (no `ReadCounter`) ----
+
+    /// Any IO call panics: used to prove Unportable/Opaque paths cost zero IO.
+    struct NeverIo;
+
+    impl LocatorIo for NeverIo {
+        fn canonicalize(&self, _path: &Path) -> std::io::Result<PathBuf> {
+            panic!("resolve must not touch IO for this input");
+        }
+        fn sha256_file(&self, _path: &Path) -> std::io::Result<String> {
+            panic!("resolve must not touch IO for this input");
+        }
+    }
+
+    struct FakeIo {
+        canonical: std::collections::BTreeMap<PathBuf, PathBuf>,
+        hashes: std::collections::BTreeMap<PathBuf, String>,
+    }
+
+    impl LocatorIo for FakeIo {
+        fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+            self.canonical
+                .get(path)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "canonical"))
+        }
+        fn sha256_file(&self, path: &Path) -> std::io::Result<String> {
+            self.hashes
+                .get(path)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "hash"))
+        }
+    }
+
+    fn resolve_with(locator: &str, root: &str, io: &dyn LocatorIo) -> ResolveReport {
+        let loc = normalize(locator, Path::new(root), Some("actual".to_string()), None, None)
+            .expect("normalize");
+        resolve(&loc, Path::new(root), io, SectionCheck::Unavailable)
+    }
+
+    // T2/T4 - non-portable kinds cost zero IO and report io == default.
+    #[test]
+    fn t2_t4_unportable_costs_no_io() {
+        let external = resolve_with("/etc/passwd", "/root", &NeverIo);
+        assert_eq!(
+            external.outcome,
+            ResolveOutcome::Unportable(UnportableReason::NotPortable)
+        );
+        assert_eq!(external.io, IoStats::default());
+
+        let opaque = resolve_with("https://example.com/x", "/root", &NeverIo);
+        assert_eq!(
+            opaque.outcome,
+            ResolveOutcome::Unportable(UnportableReason::NotPortable)
+        );
+        assert_eq!(opaque.section, SectionStatus::NotEvaluated);
+        assert_eq!(opaque.io, IoStats::default());
+    }
+
+    // Item 3 - `resolve` writes its own counts: 2 canonicalize calls + 1 hash read.
+    #[test]
+    fn resolve_counts_io_on_current() {
+        let mut canonical = std::collections::BTreeMap::new();
+        canonical.insert(PathBuf::from("/root"), PathBuf::from("/real/root"));
+        canonical.insert(
+            PathBuf::from("/real/root/src/a.md"),
+            PathBuf::from("/real/root/src/a.md"),
+        );
+        let mut hashes = std::collections::BTreeMap::new();
+        hashes.insert(PathBuf::from("/real/root/src/a.md"), "actual".to_string());
+        let io = FakeIo { canonical, hashes };
+
+        let report = resolve_with("src/a.md", "/root", &io);
+        assert_eq!(
+            report.outcome,
+            ResolveOutcome::Current {
+                sha256: "actual".to_string()
+            }
+        );
+        assert_eq!(
+            report.io,
+            IoStats {
+                canonicalize_calls: 2,
+                hash_reads: 1
+            }
+        );
+    }
+
+    // Boundary: a different measured sha is ContentDrift, never Current/Missing.
+    #[test]
+    fn resolve_reports_content_drift() {
+        let mut canonical = std::collections::BTreeMap::new();
+        canonical.insert(PathBuf::from("/root"), PathBuf::from("/root"));
+        canonical.insert(
+            PathBuf::from("/root/src/a.md"),
+            PathBuf::from("/root/src/a.md"),
+        );
+        let mut hashes = std::collections::BTreeMap::new();
+        hashes.insert(PathBuf::from("/root/src/a.md"), "actual".to_string());
+        let io = FakeIo { canonical, hashes };
+
+        let loc = normalize(
+            "src/a.md",
+            Path::new("/root"),
+            Some("expected".to_string()),
+            None,
+            None,
+        )
+        .expect("normalize");
+        let report = resolve(&loc, Path::new("/root"), &io, SectionCheck::Unavailable);
+        assert_eq!(
+            report.outcome,
+            ResolveOutcome::ContentDrift {
+                expected: "expected".to_string(),
+                actual: "actual".to_string()
+            }
+        );
+    }
+
+    // ---- gate 2 item 3: PortableGroup boundary ----
+
+    fn group_locator(relpath: &str, line: Option<u32>) -> EvidenceLocatorV1 {
+        EvidenceLocatorV1 {
+            kind: LocatorKind::ProjectRelative,
+            relpath: Some(relpath.to_string()),
+            line,
+            span: None,
+            content_sha256: None,
+            section_expected: None,
+            origin_hint: None,
+            original: format!("{relpath}#L{line:?}"),
+        }
+    }
+
+    fn opaque_locator(original: &str) -> EvidenceLocatorV1 {
+        EvidenceLocatorV1 {
+            kind: LocatorKind::Opaque,
+            relpath: None,
+            line: None,
+            span: None,
+            content_sha256: None,
+            section_expected: None,
+            origin_hint: None,
+            original: original.to_string(),
+        }
+    }
+
+    // T25 - conservation and the four-part key: line/span split groups; opaque never joins.
+    #[test]
+    fn t25_group_conservation_and_key_quad() {
+        let inputs = vec![
+            GroupInput {
+                work_item_external_key: "W-1".to_string(),
+                evidence_id: Id::from(1u128),
+                locator: group_locator("a/b.md", None),
+                outcome: ResolveOutcome::Current {
+                    sha256: "s1".to_string(),
+                },
+                section_check_unavailable: false,
+            },
+            GroupInput {
+                work_item_external_key: "W-1".to_string(),
+                evidence_id: Id::from(2u128),
+                locator: group_locator("a/b.md", None),
+                outcome: ResolveOutcome::Unbound,
+                section_check_unavailable: true,
+            },
+            GroupInput {
+                work_item_external_key: "W-1".to_string(),
+                evidence_id: Id::from(3u128),
+                locator: group_locator("a/b.md", Some(3)),
+                outcome: ResolveOutcome::Missing,
+                section_check_unavailable: false,
+            },
+            GroupInput {
+                work_item_external_key: "W-1".to_string(),
+                evidence_id: Id::from(4u128),
+                locator: opaque_locator("https://example.com/x"),
+                outcome: ResolveOutcome::Unportable(UnportableReason::NotPortable),
+                section_check_unavailable: false,
+            },
+        ];
+
+        let report = group_records(&inputs);
+        assert_eq!(report.groups.len(), 2, "line is part of the key");
+        assert_eq!(report.unportable.len(), 1, "opaque never joins a group");
+
+        let grouped: usize = report.groups.iter().map(|g| g.evidence_ids.len()).sum();
+        assert_eq!(grouped + report.unportable.len(), inputs.len(), "conservation");
+
+        let merged = report
+            .groups
+            .iter()
+            .find(|g| g.line.is_none())
+            .expect("merged group");
+        assert_eq!(
+            merged.evidence_ids,
+            vec![Id::from(1u128), Id::from(2u128)],
+            "ids sorted ascending"
+        );
+        assert_eq!(merged.outcome, ResolveOutcome::Unbound, "priority 2 > 1");
+        assert!(merged.section_check_unavailable);
+    }
+
+    // T26 - fixed seven-level priority and deterministic tie handling.
+    #[test]
+    fn t26_group_outcome_priority_is_fixed() {
+        let io_failed = outcome_priority(&ResolveOutcome::IoFailed { op: IoOp::Hash });
+        let unportable = outcome_priority(&ResolveOutcome::Unportable(UnportableReason::PathEscape));
+        let section = outcome_priority(&ResolveOutcome::SectionDrift {
+            expected: Some("e".to_string()),
+            actual: Some("a".to_string()),
+        });
+        let content = outcome_priority(&ResolveOutcome::ContentDrift {
+            expected: "e".to_string(),
+            actual: "a".to_string(),
+        });
+        let missing = outcome_priority(&ResolveOutcome::Missing);
+        let unbound = outcome_priority(&ResolveOutcome::Unbound);
+        let current = outcome_priority(&ResolveOutcome::Current {
+            sha256: "s".to_string(),
+        });
+        assert!(io_failed > unportable);
+        assert!(unportable > section);
+        assert!(section > content);
+        assert!(content > missing);
+        assert!(missing > unbound);
+        assert!(unbound > current);
+
+        let inputs = vec![
+            GroupInput {
+                work_item_external_key: "W-1".to_string(),
+                evidence_id: Id::from(10u128),
+                locator: group_locator("a/b.md", None),
+                outcome: ResolveOutcome::ContentDrift {
+                    expected: "e".to_string(),
+                    actual: "a".to_string(),
+                },
+                section_check_unavailable: false,
+            },
+            GroupInput {
+                work_item_external_key: "W-1".to_string(),
+                evidence_id: Id::from(11u128),
+                locator: group_locator("a/b.md", None),
+                outcome: ResolveOutcome::Missing,
+                section_check_unavailable: false,
+            },
+            GroupInput {
+                work_item_external_key: "W-1".to_string(),
+                evidence_id: Id::from(12u128),
+                locator: group_locator("a/b.md", None),
+                outcome: ResolveOutcome::Current {
+                    sha256: "s".to_string(),
+                },
+                section_check_unavailable: false,
+            },
+        ];
+        let report = group_records(&inputs);
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(
+            report.groups[0].outcome,
+            ResolveOutcome::ContentDrift {
+                expected: "e".to_string(),
+                actual: "a".to_string()
+            }
+        );
     }
 }

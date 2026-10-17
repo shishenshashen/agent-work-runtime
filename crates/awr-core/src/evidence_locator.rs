@@ -867,7 +867,8 @@ pub fn group_records(inputs: &[GroupInput]) -> PortableReport {
     PortableReport { groups, unportable }
 }
 
-#[cfg(test)]mod tests {
+#[cfg(test)]
+mod tests {
     use super::*;
 
     fn at(locator: &str, root: &str) -> Result<EvidenceLocatorV1, UnportableReason> {
@@ -1097,8 +1098,14 @@ pub fn group_records(inputs: &[GroupInput]) -> PortableReport {
     }
 
     fn resolve_with(locator: &str, root: &str, io: &dyn LocatorIo) -> ResolveReport {
-        let loc = normalize(locator, Path::new(root), Some("actual".to_string()), None, None)
-            .expect("normalize");
+        let loc = normalize(
+            locator,
+            Path::new(root),
+            Some("actual".to_string()),
+            None,
+            None,
+        )
+        .expect("normalize");
         resolve(&loc, Path::new(root), io, SectionCheck::Unavailable)
     }
 
@@ -1250,7 +1257,11 @@ pub fn group_records(inputs: &[GroupInput]) -> PortableReport {
         assert_eq!(report.unportable.len(), 1, "opaque never joins a group");
 
         let grouped: usize = report.groups.iter().map(|g| g.evidence_ids.len()).sum();
-        assert_eq!(grouped + report.unportable.len(), inputs.len(), "conservation");
+        assert_eq!(
+            grouped + report.unportable.len(),
+            inputs.len(),
+            "conservation"
+        );
 
         let merged = report
             .groups
@@ -1270,7 +1281,8 @@ pub fn group_records(inputs: &[GroupInput]) -> PortableReport {
     #[test]
     fn t26_group_outcome_priority_is_fixed() {
         let io_failed = outcome_priority(&ResolveOutcome::IoFailed { op: IoOp::Hash });
-        let unportable = outcome_priority(&ResolveOutcome::Unportable(UnportableReason::PathEscape));
+        let unportable =
+            outcome_priority(&ResolveOutcome::Unportable(UnportableReason::PathEscape));
         let section = outcome_priority(&ResolveOutcome::SectionDrift {
             expected: Some("e".to_string()),
             actual: Some("a".to_string()),

@@ -8,6 +8,7 @@ mod branch_close;
 mod completion;
 mod error;
 mod event_payload;
+pub mod evidence_locator;
 mod execution;
 mod execution_adapter;
 pub use execution_adapter::*;
@@ -31,6 +32,7 @@ pub use error::{
     DiagnosticLocation, Error, ErrorReport, Result, SourceDiagnostic, render_diagnostic_details,
 };
 pub use event_payload::*;
+pub use evidence_locator::*;
 pub use execution::*;
 pub use model::*;
 pub use mutation::*;

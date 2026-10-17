@@ -239,3 +239,65 @@ fn binary_artifact_raw_output_is_exact_and_verified_evidence_needs_bindings() {
     assert_eq!(f.revision(), revision);
     f.error(&["evidence", "show", "INCOMPLETE"], "NotFound");
 }
+
+#[test]
+fn a_changed_work_section_stops_evidence_from_reporting_current() {
+    let f = Fixture::new();
+    let before = f.ok(&["work", "show", "W"]);
+    let source_sha = before["source_ref"]["source_fingerprint"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("sha256:")
+        .to_string();
+    let section_before = before["source_ref"]["section_fingerprint"].clone();
+    assert!(section_before.is_string());
+    let draft = json!({"external_key":"SECTION-CHECK","work_item_key":"W","evidence_type":"report","level":"locally_verified","summary":"Bound to one work section","locator":"section-report.txt","sha256":"a".repeat(64),"source_sha":source_sha,"command":"cargo test --test records_cli","scope":["W"],"branch_id":null,"verified_at":1});
+    fs::write(f.0.join("section-report.txt"), "SECTION_REPORT_SENTINEL\n").unwrap();
+    fs::write(
+        f.0.join("section.json"),
+        serde_json::to_vec(&draft).unwrap(),
+    )
+    .unwrap();
+    f.ok(&[
+        "evidence",
+        "add",
+        "--input",
+        "section.json",
+        "--expected-revision",
+        &f.revision(),
+    ]);
+    assert_eq!(
+        f.ok(&[
+            "evidence",
+            "show",
+            "SECTION-CHECK",
+            "--source-sha",
+            &source_sha
+        ])["currency"],
+        "current"
+    );
+
+    // Edit the work item's identity+acceptance section while the ledger source SHA
+    // the evidence was recorded against stays the requested one.
+    fs::write(
+        f.0.join("work.yaml"),
+        "work_items:\n- id: W\n  title: Implement records and more\n  status: ready\n",
+    )
+    .unwrap();
+    f.ok(&["source", "reindex"]);
+    let after = f.ok(&["work", "show", "W"]);
+    assert_ne!(after["source_ref"]["section_fingerprint"], section_before);
+    let shown = f.ok(&[
+        "evidence",
+        "show",
+        "SECTION-CHECK",
+        "--source-sha",
+        &source_sha,
+    ]);
+    assert_eq!(shown["currency"], "historical");
+    assert!(
+        shown["reasons"]
+            .to_string()
+            .contains("different work section")
+    );
+}

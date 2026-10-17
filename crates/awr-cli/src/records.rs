@@ -202,10 +202,23 @@ pub fn evidence(root: &Path, command: &EvidenceCommand, json_output: bool) -> Re
                 ));
             }
             let record = db.store.evidence(project, id)?;
-            let assessment =
-                record
-                    .clone()
-                    .assess(source_sha.as_deref(), None, db.project.current_branch_id);
+            // The work item's identity+acceptance section is the second, narrower
+            // currency binding after the source revision; resolve it from the bound
+            // work item instead of dropping it. A work item that was removed from its
+            // source leaves no section binding to compare against.
+            let section_fingerprint = match record.item.work_item_id {
+                Some(work_id) => match db.store.work_item_by_id(project, work_id) {
+                    Ok(work) => work.item.meta.source_ref.section_fingerprint,
+                    Err(Error::NotFound(_)) => None,
+                    Err(error) => return Err(error),
+                },
+                None => None,
+            };
+            let assessment = record.clone().assess(
+                source_sha.as_deref(),
+                section_fingerprint.as_deref(),
+                db.project.current_branch_id,
+            );
             let mut value = db.metadata(db.project.project_revision);
             value["evidence"] = evidence_brief(&record);
             value["currency"] = json!(assessment.currency);

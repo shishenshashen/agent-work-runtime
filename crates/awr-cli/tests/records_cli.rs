@@ -24,6 +24,29 @@ impl Fixture {
         f.ok(&["status"]);
         f
     }
+    /// A work ledger authored as Markdown: its work items carry no per-item
+    /// identity+acceptance section, only the whole-file source revision.
+    fn markdown_ledger() -> Self {
+        let root = std::env::temp_dir().join(format!("awr-records-md-{}", Id::new()));
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join("work.md"),
+            "# Reading ledger\n\n- [ ] Read notes <!-- awr:id=\"W\" --> <!-- awr:acceptance=[\"Useful note\"] -->\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("mapping.toml"),
+            "[project]\nname='Markdown work'\n\n[[sources]]\ndomain='ledger'\nrole='primary'\npath='work.md'\nadapter='markdown-ledger-v1'\n",
+        )
+        .unwrap();
+        let f = Self(root);
+        f.ok(&["init", "--manifest", "mapping.toml", "--accept"]);
+        f.ok(&["status"]);
+        f
+    }
+    fn write(&self, name: &str, text: &str) {
+        fs::write(self.0.join(name), text).unwrap();
+    }
     fn run(&self, args: &[&str], json: bool) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_awr"));
         cmd.arg("--project").arg(&self.0);
@@ -250,6 +273,7 @@ fn a_changed_work_section_stops_evidence_from_reporting_current() {
         .trim_start_matches("sha256:")
         .to_string();
     let section_before = before["source_ref"]["section_fingerprint"].clone();
+    // A yaml-ledger work item carries a per-item identity+acceptance section.
     assert!(section_before.is_string());
     let draft = json!({"external_key":"SECTION-CHECK","work_item_key":"W","evidence_type":"report","level":"locally_verified","summary":"Bound to one work section","locator":"section-report.txt","sha256":"a".repeat(64),"source_sha":source_sha,"command":"cargo test --test records_cli","scope":["W"],"branch_id":null,"verified_at":1});
     fs::write(f.0.join("section-report.txt"), "SECTION_REPORT_SENTINEL\n").unwrap();
@@ -299,5 +323,58 @@ fn a_changed_work_section_stops_evidence_from_reporting_current() {
         shown["reasons"]
             .to_string()
             .contains("different work section")
+    );
+}
+
+/// A Markdown work ledger has no per-item section binding, so currency must stay
+/// on the whole-file source revision: no section is invented, and a later source
+/// revision still makes the old record historical.
+#[test]
+fn a_work_item_without_a_section_binding_keeps_source_revision_currency() {
+    let f = Fixture::markdown_ledger();
+    let before = f.ok(&["work", "show", "W"]);
+    let source_sha = before["source_ref"]["source_fingerprint"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("sha256:")
+        .to_string();
+    assert!(before["source_ref"]["section_fingerprint"].is_null());
+    let draft = json!({"external_key":"MD-CHECK","work_item_key":"W","evidence_type":"report","level":"locally_verified","summary":"Bound to a Markdown work item","locator":"md-report.txt","sha256":"a".repeat(64),"source_sha":source_sha,"command":"cargo test --test records_cli","scope":["W"],"branch_id":null,"verified_at":1});
+    f.write("md-report.txt", "MD_REPORT_SENTINEL\n");
+    f.write("md.json", &serde_json::to_string(&draft).unwrap());
+    f.ok(&[
+        "evidence",
+        "add",
+        "--input",
+        "md.json",
+        "--expected-revision",
+        &f.revision(),
+    ]);
+    assert_eq!(
+        f.ok(&["evidence", "show", "MD-CHECK", "--source-sha", &source_sha])["currency"],
+        "current"
+    );
+
+    f.write(
+        "work.md",
+        "# Reading ledger\n\n- [ ] Read notes deeply <!-- awr:id=\"W\" --> <!-- awr:acceptance=[\"Useful note\"] -->\n",
+    );
+    f.ok(&["source", "reindex"]);
+    let after = f.ok(&["work", "show", "W"]);
+    let next_sha = after["source_ref"]["source_fingerprint"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("sha256:")
+        .to_string();
+    assert_ne!(next_sha, source_sha);
+    // Still no per-item section: the recorded revision is still the requested one.
+    assert!(after["source_ref"]["section_fingerprint"].is_null());
+    assert_eq!(
+        f.ok(&["evidence", "show", "MD-CHECK", "--source-sha", &source_sha])["currency"],
+        "current"
+    );
+    assert_eq!(
+        f.ok(&["evidence", "show", "MD-CHECK", "--source-sha", &next_sha])["currency"],
+        "historical"
     );
 }

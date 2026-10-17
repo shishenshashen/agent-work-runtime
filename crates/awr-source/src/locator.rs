@@ -18,6 +18,10 @@ pub enum Locator {
         revision: String,
         path: PathBuf,
     },
+    /// Project-root-relative path; identity is `project:///<relative-path>`.
+    Project {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +51,7 @@ impl SourceSnapshot {
             hash.update([0]);
             hash.update(&self.bytes);
             format!("sha256:{:x}", hash.finalize())
-        } else if self.locator.starts_with("file://") {
+        } else if self.locator.starts_with("file://") || self.locator.starts_with("project://") {
             fingerprint(&self.bytes)
         } else {
             return false;
@@ -166,6 +170,38 @@ fn relative(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Strip a `#L<start>[-L<end>]` selector; any other `#` stays part of the path.
+fn strip_line_suffix(value: &str) -> Result<&str> {
+    let Some(index) = value.find('#') else {
+        return Ok(value);
+    };
+    let Some(range) = value[index + 1..].strip_prefix('L') else {
+        return Ok(value);
+    };
+    let numeric = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = range.split('-');
+    let start = parts.next().unwrap_or_default();
+    let end = parts.next();
+    if !numeric(start) || parts.next().is_some() {
+        return Err(Error::InvalidInput(
+            "line suffix must be #L<start> or #L<start>-L<end>".into(),
+        ));
+    }
+    if let Some(end) = end {
+        let Some(end) = end.strip_prefix('L') else {
+            return Err(Error::InvalidInput(
+                "line suffix must be #L<start> or #L<start>-L<end>".into(),
+            ));
+        };
+        if !numeric(end) {
+            return Err(Error::InvalidInput(
+                "line suffix must be #L<start> or #L<start>-L<end>".into(),
+            ));
+        }
+    }
+    Ok(&value[..index])
+}
+
 /// RFC 3986 scheme: an ASCII letter followed by letters, digits, `+`, `.` or `-`.
 fn is_scheme(value: &str) -> bool {
     let mut chars = value.chars();
@@ -194,6 +230,20 @@ impl Locator {
                         .join("/");
                 Ok(format!("git://{revision}:{path}"))
             }
+            Self::Project { path } => {
+                relative(path)?;
+                let path = path
+                    .components()
+                    .filter_map(|part| match part {
+                        Component::Normal(value) => Some(value.to_str().ok_or_else(|| {
+                            Error::InvalidInput("project path must be UTF-8".into())
+                        })),
+                        _ => None,
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .join("/");
+                Ok(format!("project:///{path}"))
+            }
         }
     }
     pub fn from_spec(root: &Path, manifest: &Manifest, spec: &SourceSpec) -> Result<Self> {
@@ -205,14 +255,18 @@ impl Locator {
             .as_deref()
             .ok_or_else(|| Error::InvalidInput("missing locator".into()))?;
         // A manifest locator keeps the original strict rule: only the canonical
-        // `file://` URL and the pinned `git://` form are accepted, so no manifest
-        // that parsed before changes meaning now that evidence locators are also
-        // normalized. Bare paths stay the `path` field's job.
-        if value.starts_with("file://") || value.starts_with("git://") {
+        // `file://` URL, the pinned `git://` form and the project-relative
+        // `project:///` form are accepted, so no manifest that parsed before
+        // changes meaning now that evidence locators are also normalized. Bare
+        // paths stay the `path` field's job.
+        if value.starts_with("file://")
+            || value.starts_with("git://")
+            || value.starts_with("project://")
+        {
             return Self::parse(root, manifest, value);
         }
         Err(Error::Unsupported(
-            "V1 supports file:// and git:// sources".into(),
+            "V1 supports file://, git:// and project:// sources".into(),
         ))
     }
 
@@ -220,16 +274,20 @@ impl Locator {
     ///
     /// Accepted forms are the canonical `file://` URL produced by
     /// [`Locator::identity`], a pinned
-    /// `git://<revision>:<project-relative-path>` locator, and a bare filesystem
-    /// path (the form `awr evidence add` has always accepted). `file://` URLs and
-    /// bare paths are canonicalized and must stay inside the project root or a
-    /// configured authorized root; Git paths must stay project-relative. Any other
-    /// scheme is reported as unsupported before the filesystem is touched, so a
-    /// remote reference never costs a read.
+    /// `git://<revision>:<project-relative-path>` locator, a
+    /// `project:///<project-relative-path>` locator that resolves against the
+    /// current checkout, and a bare filesystem path (the form `awr evidence add`
+    /// has always accepted). A `#L<start>[-L<end>]` line selector is stripped
+    /// before any of them is resolved, so it never enters identity or fingerprint.
+    /// `file://`, `project:///` and bare paths are canonicalized and must stay
+    /// inside the project root or a configured authorized root; Git paths must
+    /// stay project-relative. Any other scheme is reported as unsupported before
+    /// the filesystem is touched, so a remote reference never costs a read.
     pub fn parse(root: &Path, manifest: &Manifest, value: &str) -> Result<Self> {
         if value.trim().is_empty() {
             return Err(Error::InvalidInput("locator must not be empty".into()));
         }
+        let value = strip_line_suffix(value)?;
         if value.starts_with("file://") {
             let url = Url::parse(value).map_err(|e| Error::InvalidInput(e.to_string()))?;
             if url.query().is_some() || url.fragment().is_some() {
@@ -261,9 +319,22 @@ impl Locator {
                 path,
             });
         }
+        if let Some(value) = value.strip_prefix("project://") {
+            let Some(path) = value.strip_prefix('/') else {
+                return Err(Error::InvalidInput(
+                    "project locator syntax is project:///<project-relative-path>".into(),
+                ));
+            };
+            let path = PathBuf::from(path);
+            relative(&path)?;
+            // The same authority check as file:// sources: a project locator can
+            // never point outside the project or its authorized roots.
+            Self::file(root, manifest, &path)?;
+            return Ok(Self::Project { path });
+        }
         if value.contains("://") {
             return Err(Error::Unsupported(
-                "V1 supports file:// and git:// sources".into(),
+                "V1 supports file://, git:// and project:// sources".into(),
             ));
         }
         // An URI-scheme prefix such as `node:`, `s3:` or a `file:`/`git:` spelling
@@ -276,7 +347,7 @@ impl Locator {
             && is_scheme(scheme)
         {
             return Err(Error::Unsupported(format!(
-                "unsupported locator scheme {scheme}: V1 supports file:// and git:// sources"
+                "unsupported locator scheme {scheme}: V1 supports file://, git:// and project:// sources"
             )));
         }
         Self::file(root, manifest, Path::new(value))
@@ -332,6 +403,29 @@ impl Locator {
                     .map_err(|_| Error::InvalidInput("invalid file locator".into()))?
                     .to_string();
                 let content_review = crate::content_review::load_review(root, &locator, &bytes)?;
+                let snapshot = SourceSnapshot {
+                    locator,
+                    fingerprint: fingerprint(&bytes),
+                    bytes,
+                    content_review,
+                };
+                snapshot.validate_content()?;
+                Ok(snapshot)
+            }
+            Self::Project { path } => {
+                let root = root.canonicalize()?;
+                let resolved = root
+                    .join(path)
+                    .canonicalize()
+                    .map_err(|e| Error::SourceUnavailable(e.to_string()))?;
+                if !resolved.starts_with(&root) {
+                    return Err(Error::RuleViolation(
+                        "project source escapes the project root".into(),
+                    ));
+                }
+                let bytes = read_source_for_review(&resolved, cap)?;
+                let locator = self.identity()?;
+                let content_review = crate::content_review::load_review(&root, &locator, &bytes)?;
                 let snapshot = SourceSnapshot {
                     locator,
                     fingerprint: fingerprint(&bytes),
@@ -496,7 +590,7 @@ mod tests {
 
     #[test]
     fn unknown_scheme_is_not_a_fingerprint_authority() {
-        for locator in ["https://example.com/x", "node:events", "project://p/a.md"] {
+        for locator in ["https://example.com/x", "node:events"] {
             assert!(
                 !snapshot(locator, b"hello\n", "sha256:00").verify_fingerprint(),
                 "{locator}"

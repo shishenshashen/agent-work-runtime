@@ -1,10 +1,7 @@
 use crate::{REGISTERED_CONTENT_READ_CAP, Runtime};
 use awr_core::*;
 use sha2::{Digest, Sha256};
-use std::{
-    io::Read,
-    path::{Component, Path, PathBuf},
-};
+use std::{io::Read, path::Path};
 
 impl Runtime<'_> {
     /// Load current trusted policy before calling. The selected scope authorizes
@@ -140,18 +137,33 @@ pub(crate) fn read_registered_file(
             "project root moved since registration".into(),
         ));
     }
-    let path = match project_relative_path(locator)? {
-        Some(relative) => root
-            .join(relative)
-            .canonicalize()
-            .map_err(|error| Error::SourceUnavailable(error.to_string()))?,
-        None => if Path::new(locator).is_absolute() {
-            Path::new(locator).to_path_buf()
-        } else {
-            root.join(locator)
+    if locator.starts_with("project://") {
+        // One read path for project locators: `Locator` owns the syntax, the
+        // project-root rule and the byte read, so this function carries no
+        // second parser or containment rule of its own. Bytes that differ from
+        // the declared `sha256` fail below and never fall back to another copy.
+        let manifest = awr_source::Manifest::load(&root)?;
+        let snapshot =
+            awr_source::Locator::parse(&root, &manifest, locator)?.read(&root, max_bytes)?;
+        let bytes = snapshot.bytes;
+        if expected_size.is_some_and(|size| size != bytes.len() as u64) {
+            return Err(Error::SourceConflict(
+                "artifact size differs from its registered metadata".into(),
+            ));
         }
-        .canonicalize()?,
-    };
+        verify_registered_sha(&bytes, expected_sha)?;
+        ensure_public_bytes(&bytes)?;
+        return Ok(bytes);
+    }
+    if locator.contains("://") {
+        return Err(Error::Unsupported("body reads currently support registered local paths and project locators; use the report locator for remote content".into()));
+    }
+    let path = if Path::new(locator).is_absolute() {
+        Path::new(locator).to_path_buf()
+    } else {
+        root.join(locator)
+    }
+    .canonicalize()?;
     let allowed = path.starts_with(&root)
         || (root.join(".awr/project.toml").exists()
             && awr_source::Manifest::load(&root)?
@@ -205,45 +217,25 @@ pub(crate) fn read_registered_file(
             "registered content changed during reading".into(),
         ));
     }
-    if let Some(expected) = expected_sha {
-        let actual = format!("{:x}", Sha256::digest(&bytes));
-        if !actual.eq_ignore_ascii_case(expected) {
-            return Err(Error::SourceConflict(format!(
-                "registered content bytes no longer match the SHA256 bound at registration: expected {expected}, actual {actual}; the file must stay byte-identical, so check for added or removed trailing newlines, whitespace or line-ending changes since the evidence was registered"
-            )));
-        }
-    }
+    verify_registered_sha(&bytes, expected_sha)?;
     ensure_public_bytes(&bytes)?;
     Ok(bytes)
 }
 
-/// Resolve a `project:///<project-relative-path>` locator to its relative path.
+/// Refuse bytes that no longer match the SHA256 bound at registration.
 ///
-/// `Ok(None)` means the locator is not a project locator and keeps the
-/// pre-existing local-path handling. Every other scheme stays refused, so this
-/// opens `project://` and nothing else.
-fn project_relative_path(locator: &str) -> Result<Option<PathBuf>> {
-    let Some(rest) = locator.strip_prefix("project://") else {
-        if locator.contains("://") {
-            return Err(Error::Unsupported("body reads currently support registered local paths and project locators; use the report locator for remote content".into()));
-        }
-        return Ok(None);
+/// Both the local-path read and the project-locator read call this, so a node
+/// whose checkout holds different bytes for the same relative path fails here
+/// instead of falling back to another copy.
+fn verify_registered_sha(bytes: &[u8], expected_sha: Option<&str>) -> Result<()> {
+    let Some(expected) = expected_sha else {
+        return Ok(());
     };
-    let Some(rest) = rest.strip_prefix('/') else {
-        return Err(Error::InvalidInput(
-            "project locator syntax is project:///<project-relative-path>".into(),
-        ));
-    };
-    let path = PathBuf::from(rest);
-    if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-    {
-        return Err(Error::RuleViolation(
-            "project source path must stay inside the project".into(),
-        ));
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(Error::SourceConflict(format!(
+            "registered content bytes no longer match the SHA256 bound at registration: expected {expected}, actual {actual}; the file must stay byte-identical, so check for added or removed trailing newlines, whitespace or line-ending changes since the evidence was registered"
+        )));
     }
-    Ok(Some(path))
+    Ok(())
 }

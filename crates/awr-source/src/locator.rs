@@ -18,6 +18,10 @@ pub enum Locator {
         revision: String,
         path: PathBuf,
     },
+    /// Project-root-relative path; identity is `project:///<relative-path>`.
+    Project {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +51,7 @@ impl SourceSnapshot {
             hash.update([0]);
             hash.update(&self.bytes);
             format!("sha256:{:x}", hash.finalize())
-        } else if self.locator.starts_with("file://") {
+        } else if self.locator.starts_with("file://") || self.locator.starts_with("project://") {
             fingerprint(&self.bytes)
         } else {
             return false;
@@ -187,6 +191,20 @@ impl Locator {
                         .join("/");
                 Ok(format!("git://{revision}:{path}"))
             }
+            Self::Project { path } => {
+                relative(path)?;
+                let path = path
+                    .components()
+                    .filter_map(|part| match part {
+                        Component::Normal(value) => Some(value.to_str().ok_or_else(|| {
+                            Error::InvalidInput("project path must be UTF-8".into())
+                        })),
+                        _ => None,
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .join("/");
+                Ok(format!("project:///{path}"))
+            }
         }
     }
     pub fn from_spec(root: &Path, manifest: &Manifest, spec: &SourceSpec) -> Result<Self> {
@@ -197,6 +215,14 @@ impl Locator {
             .locator
             .as_deref()
             .ok_or_else(|| Error::InvalidInput("missing locator".into()))?;
+        Self::parse(root, manifest, value)
+    }
+    /// Parse a locator string.
+    ///
+    /// The string is parsed verbatim: a `#L<start>[-L<end>]` line selector is a
+    /// presentation concern and is not accepted here, so `file://` keeps
+    /// rejecting any fragment and `git://` keeps treating `#` as path bytes.
+    pub fn parse(root: &Path, manifest: &Manifest, value: &str) -> Result<Self> {
         if value.starts_with("file://") {
             let url = Url::parse(value).map_err(|e| Error::InvalidInput(e.to_string()))?;
             if url.query().is_some() || url.fragment().is_some() {
@@ -228,8 +254,30 @@ impl Locator {
                 path,
             });
         }
+        if let Some(value) = value.strip_prefix("project://") {
+            let Some(path) = value.strip_prefix('/') else {
+                return Err(Error::InvalidInput(
+                    "project locator syntax is project:///<project-relative-path>".into(),
+                ));
+            };
+            if path.contains('#') {
+                return Err(Error::InvalidInput(
+                    "project locator does not support a line selector".into(),
+                ));
+            }
+            let path = PathBuf::from(path);
+            // One rule, enforced here and in `read`: a project locator resolves
+            // against the project root and nothing else. Authorized roots are
+            // node-local configuration, so letting them satisfy a project
+            // locator would resolve one stored string to different bytes on
+            // another node. `file://` locators keep using authorized roots.
+            relative(&path).map_err(|_| {
+                Error::RuleViolation("project locator must stay inside the project root".into())
+            })?;
+            return Ok(Self::Project { path });
+        }
         Err(Error::Unsupported(
-            "V1 supports file:// and git:// sources".into(),
+            "V1 supports file://, git:// and project:// sources".into(),
         ))
     }
     fn file(root: &Path, manifest: &Manifest, path: &Path) -> Result<Self> {
@@ -264,6 +312,29 @@ impl Locator {
                     .map_err(|_| Error::InvalidInput("invalid file locator".into()))?
                     .to_string();
                 let content_review = crate::content_review::load_review(root, &locator, &bytes)?;
+                let snapshot = SourceSnapshot {
+                    locator,
+                    fingerprint: fingerprint(&bytes),
+                    bytes,
+                    content_review,
+                };
+                snapshot.validate_content()?;
+                Ok(snapshot)
+            }
+            Self::Project { path } => {
+                let root = root.canonicalize()?;
+                let resolved = root
+                    .join(path)
+                    .canonicalize()
+                    .map_err(|e| Error::SourceUnavailable(e.to_string()))?;
+                if !resolved.starts_with(&root) {
+                    return Err(Error::RuleViolation(
+                        "project source escapes the project root".into(),
+                    ));
+                }
+                let bytes = read_source_for_review(&resolved, cap)?;
+                let locator = self.identity()?;
+                let content_review = crate::content_review::load_review(&root, &locator, &bytes)?;
                 let snapshot = SourceSnapshot {
                     locator,
                     fingerprint: fingerprint(&bytes),

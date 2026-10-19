@@ -186,8 +186,12 @@ pub(crate) fn rows(text: &str, spec: &SourceSpec) -> Result<Vec<Row>> {
             let value_start = start + field.find('=').unwrap() + 1;
             let leading = value.len() - value.trim_start().len();
             let trailing = value.trim_end().len();
-            let value: Value = serde_json::from_str(value.trim())
-                .map_err(|_| Error::InvalidInput("invalid Markdown work metadata JSON".into()))?;
+            let value: Value = serde_json::from_str(value.trim()).map_err(|error| {
+                Error::InvalidInput(format!(
+                    "invalid Markdown work metadata JSON for field {key}: {}",
+                    awr_core::redact_schema_error_detail(&error.to_string())
+                ))
+            })?;
             if row.metadata.iter().any(|(k, _)| k == key) {
                 return Err(Error::SourceConflict(
                     "duplicate Markdown work metadata".into(),
@@ -295,4 +299,35 @@ pub(crate) fn metadata_value(v: &Value) -> Result<String> {
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('-', "\\u002d"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn spec() -> SourceSpec {
+        SourceSpec {
+            domain: "ledger".into(),
+            role: "primary".into(),
+            path: Some(PathBuf::from("ledger.md")),
+            locator: None,
+            adapter: "markdown-ledger-v1".into(),
+            options: toml::Table::new(),
+        }
+    }
+
+    #[test]
+    fn metadata_json_error_names_the_field_and_the_parser_position() {
+        let error = match rows("- [ ] A task <!-- awr:status=nope -->\n", &spec()) {
+            Ok(_) => panic!("expected the malformed metadata value to be rejected"),
+            Err(error) => error,
+        };
+        let Error::InvalidInput(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        let prefix = "invalid Markdown work metadata JSON for field status: ";
+        assert!(message.starts_with(prefix), "{message}");
+        assert!(message.contains("line 1 column 2"), "{message}");
+    }
 }

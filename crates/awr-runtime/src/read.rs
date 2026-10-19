@@ -130,15 +130,33 @@ pub(crate) fn read_registered_file(
             "artifact exceeds {max_bytes} byte read limit"
         )));
     }
-    if locator.contains("://") {
-        return Err(Error::Unsupported("body reads currently support registered local paths; use the report locator for remote content".into()));
-    }
     let project = store.project(project)?;
     let root = project.root.canonicalize()?;
     if root != project.root {
         return Err(Error::SourceConflict(
             "project root moved since registration".into(),
         ));
+    }
+    if locator.starts_with("project://") {
+        // One read path for project locators: `Locator` owns the syntax, the
+        // project-root rule and the byte read, so this function carries no
+        // second parser or containment rule of its own. Bytes that differ from
+        // the declared `sha256` fail below and never fall back to another copy.
+        let manifest = awr_source::Manifest::load(&root)?;
+        let snapshot =
+            awr_source::Locator::parse(&root, &manifest, locator)?.read(&root, max_bytes)?;
+        let bytes = snapshot.bytes;
+        if expected_size.is_some_and(|size| size != bytes.len() as u64) {
+            return Err(Error::SourceConflict(
+                "artifact size differs from its registered metadata".into(),
+            ));
+        }
+        verify_registered_sha(&bytes, expected_sha)?;
+        ensure_public_bytes(&bytes)?;
+        return Ok(bytes);
+    }
+    if locator.contains("://") {
+        return Err(Error::Unsupported("body reads currently support registered local paths and project locators; use the report locator for remote content".into()));
     }
     let path = if Path::new(locator).is_absolute() {
         Path::new(locator).to_path_buf()
@@ -188,16 +206,27 @@ pub(crate) fn read_registered_file(
             "registered content changed during reading".into(),
         ));
     }
-    if let Some(expected) = expected_sha {
-        let actual = format!("{:x}", Sha256::digest(&bytes));
-        if !actual.eq_ignore_ascii_case(expected) {
-            return Err(Error::SourceConflict(format!(
-                "registered content bytes no longer match the SHA256 bound at registration: expected {expected}, actual {actual}; the file must stay byte-identical, so check for added or removed trailing newlines, whitespace or line-ending changes since the evidence was registered"
-            )));
-        }
-    }
+    verify_registered_sha(&bytes, expected_sha)?;
     ensure_public_bytes(&bytes)?;
     Ok(bytes)
+}
+
+/// Refuse bytes that no longer match the SHA256 bound at registration.
+///
+/// Both the local-path read and the project-locator read call this, so a node
+/// whose checkout holds different bytes for the same relative path fails here
+/// instead of falling back to another copy.
+fn verify_registered_sha(bytes: &[u8], expected_sha: Option<&str>) -> Result<()> {
+    let Some(expected) = expected_sha else {
+        return Ok(());
+    };
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(Error::SourceConflict(format!(
+            "registered content bytes no longer match the SHA256 bound at registration: expected {expected}, actual {actual}; the file must stay byte-identical, so check for added or removed trailing newlines, whitespace or line-ending changes since the evidence was registered"
+        )));
+    }
+    Ok(())
 }
 
 /// The one containment rule for registered content: a canonical path is allowed

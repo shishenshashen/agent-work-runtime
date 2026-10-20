@@ -1,0 +1,138 @@
+name: OCR manual review (on demand)
+
+# NOT a merge gate. One run costs roughly 0.3-0.8M tokens and 9-10 minutes.
+# Trigger manually only; never wire this into pull_request or push events.
+#
+# Required repository secret: OCR_LLM_KEY (the review model API key).
+# The reviewer endpoint must be reachable from GitHub-hosted runners.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: string
+      commit_sha:
+        description: 'Commit sha to review (empty = PR head)'
+        required: false
+        type: string
+      max_tokens_budget:
+        description: 'Hard cap on total tokens (input+output) for this run'
+        required: false
+        default: '300000'
+        type: string
+      post_comment:
+        description: 'Post findings back to the PR as a comment'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ocr-review-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install open-code-review
+        run: npm install -g @alibaba-group/open-code-review@1.13.0
+
+      - name: Write provider config
+        env:
+          OCR_LLM_KEY: ${{ secrets.OCR_LLM_KEY }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          cfg = {
+              "provider": "yk",
+              "custom_providers": {
+                  "yk": {
+                      "api_key": os.environ["OCR_LLM_KEY"],
+                      "url": "http://118.145.236.96:3001/v1",
+                      "protocol": "openai",
+                      "model": "cn:deepseek-v4.1-flash",
+                  }
+              },
+              "llm": {},
+          }
+          path = os.path.expanduser("~/.opencodereview/config.json")
+          os.makedirs(os.path.dirname(path), exist_ok=True)
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump(cfg, handle, indent=2)
+          print("wrote", path)
+          PY
+
+      - name: Resolve target commit
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="${{ inputs.commit_sha }}"
+          if [ -z "$sha" ]; then
+            sha=$(gh api "repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}" --jq .head.sha)
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "resolved commit: $sha"
+
+      - name: Preview the file set
+        run: ocr review --commit "${{ steps.target.outputs.sha }}" --preview
+
+      - name: Run the review
+        run: |
+          set -o pipefail
+          ocr review \
+            --commit "${{ steps.target.outputs.sha }}" \
+            --format json \
+            --effort medium \
+            --max-tokens-budget "${{ inputs.max_tokens_budget }}" \
+            --output ocr-review.json | tee ocr-review.log
+
+      - name: Count findings
+        if: always()
+        run: |
+          if [ -f ocr-review.json ]; then
+            python3 - <<'PY'
+          import json
+          with open("ocr-review.json", encoding="utf-8") as handle:
+              data = json.load(handle)
+          findings = data.get("findings") or data.get("comments") or []
+          print("findings =", len(findings))
+          PY
+          fi
+
+      - name: Upload review artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr-review-pr${{ inputs.pr_number }}
+          path: |
+            ocr-review.json
+            ocr-review.log
+          if-no-files-found: warn
+
+      - name: Post findings to the PR
+        if: ${{ inputs.post_comment == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr comment "${{ inputs.pr_number }}" --repo "${{ github.repository }}" --body-file ocr-review.log

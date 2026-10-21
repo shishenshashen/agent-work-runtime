@@ -1639,6 +1639,24 @@ mod tests {
     }
 
     #[test]
+    fn issue_372_notes_json_fixture_stays_public() {
+        let notes = serde_json::json!([
+            {"comment": "FALSE=无附件；TRUE=有附件"},
+            {"comment": "FALSE=关闭同库位多目的地；TRUE=开启"},
+            {"comment": "NULL=历史未设置"}
+        ]);
+        let bytes = serde_json::to_vec(&notes).unwrap();
+        ensure_public_value(&notes).unwrap();
+        ensure_public_bytes(&bytes).unwrap();
+        assert!(
+            crate::ContentAssessment::scan(&bytes, "notes.json")
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn literal_legends_do_not_hide_environment_or_sensitive_values() {
         for text in [
             "MODE=enabled",

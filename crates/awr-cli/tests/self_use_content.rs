@@ -68,6 +68,69 @@ fn public_command_and_permission_notes_survive_intake_query_and_reindex() {
 }
 
 #[test]
+fn boolean_gloss_notes_with_short_phrases_init_as_public() {
+    let p = Project::new();
+    fs::create_dir(p.0.join("notes")).unwrap();
+    // One complete legend per file, mirroring one JSON comment per string.
+    for (name, legend) in [
+        ("a.md", "FALSE=无附件；TRUE=有附件"),
+        ("b.md", "FALSE=关闭同库位多目的地；TRUE=开启"),
+        ("c.md", "NULL=历史未设置"),
+    ] {
+        fs::write(p.0.join("notes").join(name), legend).unwrap();
+    }
+    fs::write(
+        p.0.join("gloss.toml"),
+        "[project]\nname='Gloss notes'\ncontext_profile='minimal'\n[[sources]]\ndomain='decisions'\nrole='supporting'\npath='notes'\nadapter='markdown-directory-v1'\n",
+    )
+    .unwrap();
+    let (ok, preview, error) = p.run(&["init", "--manifest", "gloss.toml"]);
+    assert!(ok, "{error}");
+    assert_eq!(
+        preview["preview"]["source_issues"],
+        serde_json::json!([]),
+        "a legend made of short public phrases is not an environment dump"
+    );
+    let (ok, _, error) = p.run(&[
+        "init",
+        "--manifest",
+        "gloss.toml",
+        "--accept",
+        "--expected-preview",
+        preview["preview"]["fingerprint"].as_str().unwrap(),
+    ]);
+    assert!(ok, "{error}");
+}
+
+#[test]
+fn boolean_gloss_notes_still_refuse_environment_and_secret_shapes() {
+    let p = Project::new();
+    fs::create_dir(p.0.join("notes")).unwrap();
+    fs::write(
+        p.0.join("gloss.toml"),
+        "[project]\nname='Gloss notes'\ncontext_profile='minimal'\n[[sources]]\ndomain='decisions'\nrole='supporting'\npath='notes'\nadapter='markdown-directory-v1'\n",
+    )
+    .unwrap();
+    for text in [
+        "export FALSE=disabled",
+        "FALSE=disabled; HOME=/synthetic-private-value",
+        "FALSE=disabled; TRUE=sk-synthetic-private-value",
+        "environment:\n  FALSE=disabled",
+    ] {
+        fs::write(p.0.join("notes/leak.md"), format!("{text}\n")).unwrap();
+        let (ok, result, error) = p.run(&["init", "--manifest", "gloss.toml"]);
+        assert!(
+            !ok || result["preview"]["source_issues"] != serde_json::json!([]),
+            "{text}"
+        );
+        assert!(
+            !format!("{result}{error}").contains("synthetic-private-value"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn ambiguous_fields_and_dumps_return_categories_without_echo_and_can_recover() {
     let p = Project::new();
     p.source("Public guide");

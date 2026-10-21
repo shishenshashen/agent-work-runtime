@@ -1633,6 +1633,9 @@ mod tests {
             "FALSE=客户手机号",
             "FALSE=绑定银行卡",
             "FALSE=李四的银行卡号",
+            "FALSE=员工工号",
+            "FALSE=患有糖尿病",
+            "FALSE=这是凭据",
         ] {
             assert!(ensure_public_text(text).is_err(), "{text}");
         }

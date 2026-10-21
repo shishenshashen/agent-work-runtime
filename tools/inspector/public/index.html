@@ -177,9 +177,10 @@
             <span class="sub" id="eventSub"></span>
           </header>
           <p class="why-note" data-note="events" hidden>
-            <span data-i18n="ui.recent_events_note">Append-only history from</span> <code>awr event history</code><span data-i18n="ui.recent_events_note_tail">. Summaries only; full payloads stay behind event show. The panel is hidden when the command is unsupported.</span>
+            <span data-i18n="ui.recent_events_note">Append-only history from</span> <code>awr event history</code><span data-i18n="ui.recent_events_note_tail">. Select a row to run event show --full with a byte limit; the command never appends events. The panel is hidden when history is unsupported.</span>
           </p>
           <ul class="loops" id="eventList"></ul>
+          <div class="session-detail" id="eventDetail" hidden></div>
         </div>
 
         <div class="panel">

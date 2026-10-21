@@ -162,10 +162,16 @@ impl SourceAdapter for MarkdownDirectoryAdapter {
             Locator::Git { revision, path } => {
                 git_files(root, &revision, &path, options.recursive)?
             }
+            Locator::Project { .. } => {
+                return Err(Error::Unsupported(
+                    "directory sources require a file:// or git:// locator".into(),
+                ));
+            }
         };
         files.sort_by_key(|locator| match locator {
             Locator::File(path) => path.to_string_lossy().into_owned(),
             Locator::Git { path, .. } => path.to_string_lossy().into_owned(),
+            Locator::Project { path } => path.to_string_lossy().into_owned(),
         });
         Ok(files)
     }
@@ -280,6 +286,14 @@ impl SourceAdapter for MarkdownDirectoryAdapter {
         )?;
         meta.source_ref.section_fingerprint = Some(snapshot.section_fingerprint(1, lines)?);
         let decision = Decision {
+            specification: if let Some(value) = metadata.get("specification") {
+                let specification: awr_core::Specification = serde_json::from_value(value.clone())
+                    .map_err(|_| Error::InvalidInput("/specification must contain version and items with explicit id/disposition and optional superseded_by".into()))?;
+                specification.validate()?;
+                Some(specification)
+            } else {
+                None
+            },
             meta,
             title,
             status,

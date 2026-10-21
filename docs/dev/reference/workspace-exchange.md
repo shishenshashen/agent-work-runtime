@@ -231,6 +231,36 @@ projects/<key>/handoffs/<origin host>/<name>.json  交接单元（if-none-match�
 - 那 5 次 `contended` 都如实 exit 1，并且**没有任何路径被改写**——这正是它和冲突的区别：
   冲突要人决定，`contended` 只要再发布一次。
 
+## Project-relative evidence locators
+
+`project:///<project-relative-path>` makes one evidence row point at the same relative path
+inside whatever checkout each node holds.
+
+**What "project root" means.** The root stored in the project record (the directory that holds
+`.awr/project.toml`), taken through `canonicalize()` at read time. If the root has moved, the
+read fails with `project root moved since registration` instead of guessing a new location.
+
+**One rule.** A `project://` locator resolves inside the project root and nowhere else: `..`,
+absolute paths and every other escaping component are refused by `Locator::parse`
+(`project locator must stay inside the project root`), and the read repeats the containment
+check against the `canonicalize()` result. **`authorized_roots` does not take part in
+`project://`**: it is node-local configuration, so letting it satisfy a project locator would
+resolve one stored string to different bytes on different nodes. `file://` and plain paths keep
+using `authorized_roots` as before.
+
+**Different bytes must fail.** Registration resolves the locator once and stores the canonical
+identity. The content is bound at the same moment: a declared `sha256` has to match the bytes the
+locator resolves to, and when the caller declares none, the resolved digest is stored in its
+place, so the row always names the content a later node is expected to serve. Reading on another
+node then fails with
+`registered content bytes no longer match the SHA256 bound at registration` when the same
+relative path holds different bytes, and **never falls back to another copy on that node**. The
+cross-node contract is therefore "same relative path + same `sha256`", not "same machine".
+Evidence body reads (`evidence show --content`) verify against the stored `sha256`.
+
+Known limit: the locator carries no root fingerprint, so two checkouts with the same relative
+path and the same bytes cannot be told apart. Stronger root identity is still open (#348).
+
 ## 验证入口
 
 ```sh

@@ -38,6 +38,8 @@ mod operation_readset;
 mod organization;
 mod planning_writeback;
 mod read;
+mod specification;
+pub use specification::{SpecificationCheckRequest, check_specifications};
 mod responsibility;
 mod resume;
 mod source_concurrency;
@@ -213,8 +215,55 @@ impl<'a> Runtime<'a> {
         expected: Revision,
         draft: awr_core::EvidenceDraft,
     ) -> Result<(awr_core::Evidence, Event)> {
+        let draft = self.bind_project_locator(draft)?;
         reject_provably_outside_root(self.store, self.project, &draft.locator)?;
         self.store.record_evidence(self.project, expected, draft)
+    }
+    /// Resolve a `project://` locator exactly once, at registration.
+    ///
+    /// The stored string is the canonical project-relative identity, so the same
+    /// evidence row resolves against the same relative file on every node that
+    /// holds the checkout. A missing, escaping or ambiguous target is a typed
+    /// error at this point and never a guess at read time. `file://`, `git://`
+    /// and plain paths pass through untouched.
+    ///
+    /// The bytes are bound at registration either way: a declared `sha256` must
+    /// match the resolved content, and without one the resolved digest is stored
+    /// in its place. Otherwise the row would name a file but not the content a
+    /// later node is expected to serve.
+    fn bind_project_locator(
+        &self,
+        mut draft: awr_core::EvidenceDraft,
+    ) -> Result<awr_core::EvidenceDraft> {
+        if !draft.locator.starts_with("project://") {
+            return Ok(draft);
+        }
+        let project = self.store.project(self.project)?;
+        let root = project.root.canonicalize()?;
+        let manifest = awr_source::Manifest::load(&root)?;
+        let locator = awr_source::Locator::parse(&root, &manifest, &draft.locator)?;
+        let snapshot = locator.read(&root, REGISTERED_CONTENT_READ_CAP)?;
+        let actual = snapshot
+            .fingerprint
+            .strip_prefix("sha256:")
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "project locator resolved to a non-SHA256 fingerprint: {}",
+                    snapshot.fingerprint
+                ))
+            })?
+            .to_ascii_lowercase();
+        match draft.sha256.as_deref() {
+            Some(declared) if !declared.eq_ignore_ascii_case(&actual) => {
+                return Err(Error::SourceConflict(format!(
+                    "declared sha256 does not match the bytes the project locator resolves to: expected {declared}, actual {actual}"
+                )));
+            }
+            Some(_) => {}
+            None => draft.sha256 = Some(actual),
+        }
+        draft.locator = snapshot.locator;
+        Ok(draft)
     }
     pub fn handoff(
         &mut self,

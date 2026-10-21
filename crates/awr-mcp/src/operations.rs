@@ -63,6 +63,7 @@ pub(crate) fn is_read_only(name: &str) -> bool {
             | "awr_completion_prepare"
             | "awr_work_assess"
             | "awr_work_graph"
+            | "awr_spec_check"
             | "awr_change_preview"
             | "awr_change_status"
             | "awr_context_compile"
@@ -333,6 +334,9 @@ pub(crate) fn call(root: &Path, name: &str, mut args: JsonObject) -> Result<Call
             awr_runtime::assess_management(&view.store, root, &parse_tool!(name, args))?
         }
         "awr_work_graph" => awr_runtime::work_graph(&view.store, root, &parse_tool!(name, args))?,
+        "awr_spec_check" => {
+            awr_runtime::check_specifications(&view.store, root, &parse_tool!(name, args))?
+        }
         "awr_search" => search(&mut view, parse_tool!(name, args))?,
         _ => return Err(Error::Unsupported(name.into())),
     };
@@ -524,8 +528,12 @@ fn work(view: &ReadProject, args: WorkArgs) -> Result<Value> {
         args.source_sha.as_deref(),
         branch,
     )?;
+    let mut detail = ready_brief(&work);
+    if !work.work.item.spec_refs.is_empty() {
+        detail["spec_refs"] = json!(work.work.item.spec_refs);
+    }
     Ok(
-        json!({"work":ready_brief(&work),"acceptance":work.work.item.acceptance,"source_ref":work.work.item.meta.source_ref,
+        json!({"work":detail,"acceptance":work.work.item.acceptance,"source_ref":work.work.item.meta.source_ref,
         "progress":awr_runtime::work_progress(&view.store,view.project.id,&work.work,branch)?,
         "required_dependencies":work.dependencies.dependencies.iter().map(|d| json!({"external_key":d.item.meta.external_key,"status":d.item.status,"revision":d.item.meta.revision,"source_revision":d.item.meta.source_ref.source_revision,"freshness":d.source.freshness})).collect::<Vec<_>>(),
         "missing_dependencies":work.dependencies.missing_keys,"dependency_cycles":work.dependencies.cycle_keys,

@@ -158,6 +158,7 @@
       exitCode:   ['exit_code'],
     },
     // event history uses event_brief: type, not event_type.
+    // event show --full uses the Event struct (event_type) plus payload_included.
     event: {
       id:         ['id'],
       type:       ['type', 'event_type'],
@@ -165,7 +166,16 @@
       importance: ['importance'],
       session:    ['session_id'],
       work:       ['work_item_id'],
+      branch:     ['branch_id'],
+      source:     ['source_id'],
+      checkpoint: ['checkpoint_id'],
+      artifact:   ['artifact_id'],
+      payload:    ['payload'],
       createdAt:  ['created_at'],
+    },
+    eventShow: {
+      event:             ['event'],
+      payloadIncluded:   ['payload_included'],
     },
   };
 
@@ -253,6 +263,8 @@
     selectedRecovery: null,
     recoveryDetail: null,
     events: { items: [], loaded: false, error: null, command: null, mayHaveMore: false },
+    selectedEvent: null,
+    eventDetail: null,
     unsupported: new Set(),
     compile: null,
     raw: {},               // Most recent raw JSON for each view.
@@ -307,6 +319,7 @@
   const detailGuard = createGenerationGuard();
   const sessionGuard = createGenerationGuard();
   const recoveryGuard = createGenerationGuard();
+  const eventGuard = createGenerationGuard();
   let sourceGeneration = 0;
 
   // ───────────────────────── API ─────────────────────────
@@ -1381,6 +1394,11 @@
       i18n.t('ui.no_recent_events_detail'),
       (raw) => {
         const li = el('li');
+        const id = pick(raw, M.id, null);
+        const selected = id != null && String(id) === state.selectedEvent;
+        li.style.cursor = 'pointer';
+        li.setAttribute('aria-selected', selected ? 'true' : 'false');
+        li.setAttribute('aria-expanded', selected ? 'true' : 'false');
         const importance = pick(raw, M.importance, '');
         li.appendChild(el('span', 'dot' + (importance === 'high' ? ' warn' : '')));
         li.appendChild(el('span', 'what', pick(raw, M.summary, i18n.t('ui.no_description'))));
@@ -1393,9 +1411,162 @@
         const age = el('span', 'age' + (importance === 'high' ? ' hot' : ''));
         age.textContent = since(pick(raw, M.createdAt, null));
         li.appendChild(age);
+        if (id != null) {
+          li.addEventListener('click', () => {
+            void selectEvent(id);
+          });
+        }
         return li;
       }
     );
+    renderEventDetail();
+  }
+
+  function applyEventShow(id, response) {
+    const eid = id == null ? '' : String(id);
+    state.selectedEvent = eid;
+    if (isUnsupported(response)) {
+      state.unsupported.add('event.show');
+      state.eventDetail = {
+        id: eid,
+        loaded: true,
+        error: response.error,
+        data: null,
+        command: response.command,
+      };
+      return;
+    }
+    state.unsupported.delete('event.show');
+    if (response && response.ok) {
+      state.eventDetail = {
+        id: eid,
+        loaded: true,
+        error: null,
+        data: response.data || {},
+        command: response.command,
+      };
+      return;
+    }
+    state.eventDetail = {
+      id: eid,
+      loaded: true,
+      error: (response && response.error) || { code: 'Error', message: '' },
+      data: null,
+      command: response && response.command,
+    };
+  }
+
+  async function selectEvent(id) {
+    const eid = id == null ? '' : String(id);
+    if (!eid) return;
+    if (state.selectedEvent === eid && state.eventDetail && state.eventDetail.loaded) {
+      eventGuard.invalidate();
+      state.selectedEvent = null;
+      state.eventDetail = null;
+      renderEvents();
+      return;
+    }
+    const token = eventGuard.begin(eid);
+    state.selectedEvent = eid;
+    state.eventDetail = { id: eid, loaded: false, error: null, data: null, command: null };
+    renderEvents();
+
+    let response;
+    if (state.mode === 'demo') {
+      const demo = window.AWR_DEMO && window.AWR_DEMO.eventShows
+        ? window.AWR_DEMO.eventShows[eid]
+        : null;
+      response = demo
+        ? { ok: true, data: demo, command: 'awr event show ' + eid + ' --full --max-bytes 65536' }
+        : { ok: false, error: { code: 'NotFound', message: i18n.t('ui.event_show_missing') } };
+    } else {
+      response = await callApi('/api/event?id=' + encodeURIComponent(eid));
+    }
+    if (!eventGuard.isCurrent(token)) return;
+    applyEventShow(eid, response);
+    renderEvents();
+  }
+
+  function formatEventPayload(value) {
+    if (value == null) return null;
+    let text;
+    try {
+      text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    } catch (_) {
+      return null;
+    }
+    if (text === '' || text === 'null') return null;
+    const max = 4000;
+    if (text.length > max) return { text: text.slice(0, max) + '…', truncated: true };
+    return { text, truncated: false };
+  }
+
+  function renderEventDetail() {
+    const host = $('eventDetail');
+    if (!host) return;
+    clear(host);
+    if (!state.selectedEvent) {
+      host.hidden = true;
+      return;
+    }
+    host.hidden = false;
+    const bag = state.eventDetail;
+    if (!bag || !bag.loaded) {
+      host.appendChild(el('p', 'sub', i18n.t('ui.event_detail_loading')));
+      return;
+    }
+    if (bag.error) {
+      host.appendChild(errorBlock(bag.error, bag.command));
+      return;
+    }
+    const data = bag.data || {};
+    const S = FIELD_MAP.eventShow;
+    const M = FIELD_MAP.event;
+    const event = pick(data, S.event, null) || data;
+    const payloadIncluded = pick(data, S.payloadIncluded, null);
+
+    host.appendChild(el('h3', null, i18n.t('ui.event_show')));
+    if (bag.command) {
+      const cmd = el('div', 'cmd');
+      cmd.appendChild(el('span', 'prompt', '$'));
+      cmd.appendChild(el('code', null, bag.command));
+      host.appendChild(cmd);
+    }
+
+    const summary = pick(event, M.summary, null);
+    const type = pick(event, M.type, null);
+    const importance = pick(event, M.importance, null);
+    const headline = el('p', null);
+    headline.appendChild(document.createTextNode(
+      [type, importance, summary].filter(Boolean).join(' · ') || i18n.t('ui.no_description')
+    ));
+    host.appendChild(headline);
+
+    const bits = [
+      pick(event, M.id, null) != null ? 'id=' + pick(event, M.id) : '',
+      pick(event, M.session, null) != null ? 'session=' + pick(event, M.session) : '',
+      pick(event, M.work, null) != null ? 'work=' + pick(event, M.work) : '',
+      pick(event, M.branch, null) != null ? 'branch=' + pick(event, M.branch) : '',
+      pick(event, M.source, null) != null ? 'source=' + pick(event, M.source) : '',
+      pick(event, M.checkpoint, null) != null ? 'checkpoint=' + pick(event, M.checkpoint) : '',
+      pick(event, M.artifact, null) != null ? 'artifact=' + pick(event, M.artifact) : '',
+    ].filter(Boolean);
+    if (bits.length) host.appendChild(el('p', 'sub', bits.join(' · ')));
+
+    host.appendChild(el('p', 'sub', i18n.t('ui.event_payload')));
+    if (payloadIncluded === false) {
+      host.appendChild(el('p', null, i18n.t('ui.event_payload_omitted')));
+      return;
+    }
+    const formatted = formatEventPayload(pick(event, M.payload, null));
+    if (!formatted) {
+      host.appendChild(el('p', null, i18n.t('ui.event_no_payload')));
+      return;
+    }
+    host.appendChild(el('pre', null, formatted.text));
+    if (formatted.truncated) {
+      host.appendChild(el('p', 'sub', i18n.t('ui.event_payload_truncated')));
+    }
   }
 
   // Work items
@@ -2145,6 +2316,7 @@
     detailGuard.invalidate();
     sessionGuard.invalidate();
     recoveryGuard.invalidate();
+    eventGuard.invalidate();
     state.overviewWork = null;
     state.selectedWork = null;
     state.workFilter = 'all';
@@ -2161,11 +2333,13 @@
     state.selectedRecovery = null;
     state.recoveryDetail = null;
     state.events = { items: [], loaded: false, error: null, command: null, mayHaveMore: false };
+    state.selectedEvent = null;
+    state.eventDetail = null;
     state.unsupported = new Set();
     state.compile = null;
     state.raw = {};
     for (const id of ['fWork', 'workRows', 'workFilters', 'workPagination', 'workEmpty', 'workDetail',
-      'statusStrip', 'queueList', 'queueTabs', 'cpList', 'pendingList', 'recoveryDetail', 'sessionList', 'sessionDetail', 'eventList',
+      'statusStrip', 'queueList', 'queueTabs', 'cpList', 'pendingList', 'recoveryDetail', 'sessionList', 'sessionDetail', 'eventList', 'eventDetail',
       'rawWorkBody', 'rawContextBody', 'rawOverviewBody', 'rawSourcesBody']) clear($(id));
     for (const id of ['navWorkCount', 'navSourceCount', 'workSub', 'queueSub', 'gapSub', 'pendingSub',
       'sessionSub', 'eventSub', 'srcTitle', 'srcSub', 'srcCmd', 'compileHint']) setText(id, '');
@@ -2174,6 +2348,7 @@
     if ($('sessionPanel')) $('sessionPanel').hidden = true;
     if ($('sessionDetail')) $('sessionDetail').hidden = true;
     if ($('eventPanel')) $('eventPanel').hidden = true;
+    if ($('eventDetail')) $('eventDetail').hidden = true;
     $('fGoal').value = '';
     $('fIntent').value = '';
     $('compileBtn').disabled = false;
@@ -2680,6 +2855,7 @@
       renderPacketSize, doCompile, renderQueueList, fillWorkSelect, loadAll,
       renderSessions, renderEvents, applyListResponse, applySessionShow, selectSession,
       renderPending, applyRecoveryInspect, selectRecovery,
+      applyEventShow, selectEvent,
     };
   }
 })();

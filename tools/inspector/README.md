@@ -69,7 +69,7 @@ Team 工作区复用 AWR 官网的蓝白协作关系图：项目 → 工作线 �
 
 | 页面 | 回答什么 | 背后的命令 |
 | --- | --- | --- |
-| 概览 | 现在该干什么 | `awr status`（+ `awr ready` / `awr session list --active` / `awr session show` / `awr recovery inspect` / `awr event history`）|
+| 概览 | 现在该干什么 | `awr status`（+ `awr ready` / `awr session list --active` / `awr session show` / `awr recovery inspect` / `awr event history` / `awr event show`）|
 | 工作项 | 这件活要做成什么样、卡在哪 | `awr work show` |
 | 上下文 | 给 agent 的那包东西里装了什么 | `awr context compile` |
 | 索引源 | 看到的东西还算数吗 | `awr intake inspect`（读 `organization.sources`）|
@@ -85,7 +85,7 @@ Team 工作区复用 AWR 官网的蓝白协作关系图：项目 → 工作线 �
 | 概览 · 结构缺口 | `organization.gaps` 的 code / target / 说明 |
 | 概览 · 待查的运行时操作 | `pending_operations`（字段缺失时整块隐藏）；`kind=session` 的行点开后跑只读 `awr recovery inspect --session`：checkpoint / 执行观察态 / `side_effects_performed` |
 | 概览 · 活跃 session | `awr session list --active`：agent / status / work / last checkpoint；点行后 `awr session show`：next_action / open_loops / 继承 checkpoint / claims（`Unsupported` 时整块隐藏）|
-| 概览 · 最近事件 | `awr event history`：type / summary / importance / 时间（`Unsupported` 时整块隐藏）|
+| 概览 · 最近事件 | `awr event history`：type / summary / importance / 时间；点行后只读 `awr event show --full --max-bytes 65536`：metadata / payload（`history` Unsupported 时整块隐藏）|
 | 工作项 · 表格 | 队列、源状态、负责人、认领状态、诊断码、source revision |
 | 工作项 · 详情 | 目标、验收标准、阻塞/等待、依赖与未决依赖、依赖成环、**谁占着这件活**（agent / session / 到期）、**证据与决策**、诊断码 |
 | 上下文 · 完整性 | `completeness.status`、**六个维度**（规则 / 目标上下文 / 工作状态 / 验收标准 / 依赖 / 源新鲜度）、**证据缺口**、未决依赖、issues、被省略的块及原因 |
@@ -93,7 +93,7 @@ Team 工作区复用 AWR 官网的蓝白协作关系图：项目 → 工作线 �
 
 ### Session 与事件
 
-当前源码里 `awr session list --active`、`awr session show`、`awr recovery inspect` 和 `awr event history` 已经实现。概览页列出活跃 session；点一行会调用 `session show`，展开 checkpoint 的 `next_action`、open loops、继承的 checkpoint 和 claims。待查运行时操作里，`kind=session` 的行会调用只读的 `recovery inspect --session`，展示上次 checkpoint 和执行观察（running / succeeded / failed / unknown）；该命令不 refresh 源、不 resume、不重跑。其他 kind 的行说明 recovery inspect 需要 session，不把非 session id 送进 CLI。缺少的字段保持空白，不从别处补。发布版若仍返回 `Unsupported`，列表面板会隐藏，不会用空列表冒充「没有会话」。`session show` 或 `recovery inspect` 单独 Unsupported 时列表仍在，详情区显示该错误。最近事件仍只显示摘要。
+当前源码里 `awr session list --active`、`awr session show`、`awr recovery inspect`、`awr event history` 和 `awr event show` 已经实现。概览页列出活跃 session；点一行会调用 `session show`，展开 checkpoint 的 `next_action`、open loops、继承的 checkpoint 和 claims。待查运行时操作里，`kind=session` 的行会调用只读的 `recovery inspect --session`，展示上次 checkpoint 和执行观察（running / succeeded / failed / unknown）；该命令不 refresh 源、不 resume、不重跑。其他 kind 的行说明 recovery inspect 需要 session，不把非 session id 送进 CLI。最近事件点一行会调用只读的 `event show --full`（`--max-bytes 65536`），展开 metadata 和 payload；不提供 `event append`。缺少的字段保持空白，不从别处补。发布版若仍返回 `Unsupported`，列表面板会隐藏，不会用空列表冒充「没有会话」。`session show`、`recovery inspect` 或 `event show` 单独 Unsupported 时列表仍在，详情区显示该错误。
 
 ---
 

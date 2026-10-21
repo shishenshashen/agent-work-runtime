@@ -655,6 +655,9 @@ pub fn work(root: &Path, command: &WorkCommand, json_output: bool) -> Result<()>
             )?;
             let mut value = query.metadata();
             value["work"] = ready_brief(&work);
+            if !work.work.item.spec_refs.is_empty() {
+                value["work"]["spec_refs"] = json!(work.work.item.spec_refs);
+            }
             value["acceptance"] = json!(work.work.item.acceptance);
             value["source_ref"] = json!(work.work.item.meta.source_ref);
             value["progress"] =

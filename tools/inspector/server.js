@@ -267,6 +267,7 @@ const COMMANDS = {
   sessionShow: { argv: ['session', 'show'], write: false },
   recoveryInspect: { argv: ['recovery', 'inspect'], write: false },
   eventHistory: { argv: ['event', 'history'], write: false },
+  eventShow: { argv: ['event', 'show'], write: false },
   // Project map: the official read-only commands behind the snapshot (see public/project-map/extract.js).
   mapWorkGraph: { argv: ['work', 'graph'], write: false },
   mapNav: { argv: ['nav', '--cached'], write: false },
@@ -688,6 +689,16 @@ const routes = {
       return { ok: false, error: { code: 'BadRequest', message: 'limit must be an integer from 1 to 100' } };
     }
     return runCommand('eventHistory', ['--limit', String(limit)]);
+  },
+
+  'GET /api/event': async (url) => {
+    const id = asKey(url.searchParams.get('id'));
+    if (!id) {
+      return { ok: false, error: { code: 'BadRequest', message: 'A valid id parameter is required' } };
+    }
+    // --full is explicit payload expansion; cap bytes at the CLI default so the
+    // Inspector cannot raise the limit through the query string.
+    return runCommand('eventShow', [id, '--full', '--max-bytes', '65536']);
   },
 
   // Project map data. Each route is one allowlisted read-only command with validated arguments.

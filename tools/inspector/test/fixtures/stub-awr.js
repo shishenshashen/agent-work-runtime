@@ -256,6 +256,26 @@ if (mode === 'slow') {
     limit: 20,
     may_have_more: false,
   });
+} else if (joined.includes('event show')) {
+  emit({
+    ok: true,
+    project_revision: 7,
+    source_refresh_performed: false,
+    event: {
+      id: 21,
+      project_id: 1,
+      work_item_id: 1,
+      session_id: 11,
+      branch_id: 1,
+      event_type: 'session_started',
+      importance: 'normal',
+      summary: 'session started',
+      payload: { agent_id: 'stub-agent', provider: 'stub' },
+      project_revision: 7,
+      created_at: 1700000000000,
+    },
+    payload_included: true,
+  });
 } else if (joined.includes('event history')) {
   emit({
     ok: true,

@@ -356,6 +356,37 @@
       },
     ],
 
+    eventShows: {
+      501: {
+        source_refresh_performed: false,
+        event: {
+          id: 501,
+          work_item_id: 1,
+          session_id: 101,
+          event_type: 'checkpoint_saved',
+          importance: 'normal',
+          summary: i18n.t('demo.checkpoint_saved'),
+          payload: { checkpoint_id: '7', digest: 'Record the work actually done' },
+          created_at: Date.now() - 4 * 60000,
+        },
+        payload_included: true,
+      },
+      500: {
+        source_refresh_performed: false,
+        event: {
+          id: 500,
+          work_item_id: 1,
+          session_id: 101,
+          event_type: 'session_started',
+          importance: 'normal',
+          summary: i18n.t('demo.session_started'),
+          payload: { agent_id: 'lin', provider: 'cursor' },
+          created_at: Date.now() - 12 * 60000,
+        },
+        payload_included: true,
+      },
+    },
+
     /** The context compile response; budgets below 5,000 omit optional chunks. */
     compile(key, budget) {
       const brief = ALL.find((w) => w.key === key) || ALL[0];

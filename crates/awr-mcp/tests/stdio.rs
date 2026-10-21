@@ -479,6 +479,228 @@ fn success(result: CallToolResult) -> Value {
     assert_eq!(result.is_error, Some(false), "{result:?}");
     body(&result)
 }
+
+#[tokio::test]
+async fn specification_check_is_discoverable_read_only_and_conservative() {
+    let f = Fixture::new();
+    let metadata = json!({"id":"SPEC","status":"accepted","affected_keys":["W"],"specification":{"version":"2","items":[
+        {"id":"OLD","disposition":"superseded","superseded_by":"NEW"},
+        {"id":"NEW","disposition":"future"},
+        {"id":"CANCELLED","disposition":"cancelled"}
+    ]}});
+    let document = format!(
+        "---\n{}\n---\n# Synthetic specification\n\n## Decision\nUse the reviewed boundary.\n",
+        serde_json::to_string_pretty(&metadata).unwrap()
+    );
+    fs::write(f.root.join("decisions/spec.md"), &document).unwrap();
+    let reference = json!({"specification":"SPEC","item":"OLD","source_fingerprint":format!("sha256:{}","a".repeat(64)),"criterion":CRITERION});
+    fs::write(
+        f.root.join("work.yaml"),
+        WORK.replace(
+            "  verification:\n",
+            &format!("  spec_refs: [{}]\n  verification:\n", reference),
+        ),
+    )
+    .unwrap();
+    f.reindex();
+    let client = f.client().await;
+    let before = f.logical_state();
+    let source = fs::read(f.root.join("work.yaml")).unwrap();
+    let manifest = success(call(&client, "awr_work", json!({})).await);
+    let tool = manifest["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "awr_spec_check")
+        .unwrap();
+    assert_eq!(tool["read_only"], true);
+    let result = success(
+        call(
+            &client,
+            "awr_work",
+            json!({"child_tool":"awr_spec_check","arguments":{"spec":"SPEC"}}),
+        )
+        .await,
+    );
+    assert_eq!(result["status"], "needs_review");
+    assert_eq!(result["references"][0]["replacement"], "NEW");
+    assert_eq!(result["references"][0]["observed_version"], "2");
+    assert_eq!(result["references"][0]["reference"], reference);
+    assert_eq!(result["counts"]["uncovered"], 1);
+    assert_eq!(result["counts"]["not_required"], 2);
+    assert_eq!(result["read_only"], true);
+    let (store, _) = f.store();
+    let expected = awr_runtime::check_specifications(
+        &store,
+        &f.root,
+        &awr_runtime::SpecificationCheckRequest {
+            spec: Some("SPEC".into()),
+            limit: 1000,
+        },
+    )
+    .unwrap();
+    for (key, value) in expected.as_object().unwrap() {
+        assert_eq!(&result[key], value, "{key}");
+    }
+    drop(store);
+    let unknown = success(call(&client, "awr_spec_check", json!({"spec":"missing"})).await);
+    assert_eq!(unknown["status"], "unknown");
+    error(
+        call(&client, "awr_spec_check", json!({"limit":0})).await,
+        "InvalidInput",
+    );
+    assert_eq!(f.logical_state(), before);
+    assert_eq!(fs::read(f.root.join("work.yaml")).unwrap(), source);
+    assert_eq!(
+        fs::read_to_string(f.root.join("decisions/spec.md")).unwrap(),
+        document
+    );
+    fs::write(
+        f.root.join("decisions/spec.md"),
+        document + "\nChanged source.\n",
+    )
+    .unwrap();
+    error(
+        call(&client, "awr_spec_check", json!({"spec":"SPEC"})).await,
+        "SourceStale",
+    );
+    assert_eq!(f.logical_state(), before);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn specification_queue_briefs_are_bounded_and_details_preserve_bindings() {
+    let checked = |result: CallToolResult, phase: &str| {
+        assert_eq!(result.is_error, Some(false), "{phase}: {result:?}");
+        body(&result)
+    };
+    let f = Fixture::new();
+    let criterion = "Reviewed requirement ".to_owned() + &"x".repeat(4000);
+    let refs = (0..100).map(|i|json!({"specification":"SPEC","item":format!("R{i}"),"source_fingerprint":format!("sha256:{}","a".repeat(64)),"criterion":criterion})).collect::<Vec<_>>();
+    fs::write(f.root.join("work.yaml"), serde_json::to_vec(&json!({"work_items":[{"id":"W","title":"Review specification","status":"ready","next_action":"Review","acceptance":[criterion],"spec_refs":refs}]})).unwrap()).unwrap();
+    f.reindex();
+    let client = f.client().await;
+    let before = f.logical_state();
+    let queue = checked(
+        call(&client, "awr_work_ready", json!({"limit":1})).await,
+        "queue",
+    );
+    assert!(queue["ready"][0].get("spec_refs_count").is_none());
+    assert!(queue["ready"][0].get("spec_refs").is_none());
+    assert!(serde_json::to_vec(&queue).unwrap().len() < 20000);
+    let status = checked(
+        call(&client, "awr_project_status", json!({"view":"full"})).await,
+        "ready status",
+    );
+    assert!(
+        !serde_json::to_string(&status)
+            .unwrap()
+            .contains("\"spec_refs\":")
+    );
+    assert!(serde_json::to_vec(&status).unwrap().len() < 20000);
+    let detail = checked(
+        call(&client, "awr_work_get", json!({"work":"W"})).await,
+        "detail",
+    );
+    assert_eq!(detail["work"]["spec_refs"].as_array().unwrap().len(), 100);
+    let check = checked(call(&client, "awr_spec_check", json!({})).await, "coverage");
+    assert_eq!(check["references"].as_array().unwrap().len(), 100);
+    assert_eq!(f.logical_state(), before);
+    let mut ledger: Value =
+        serde_json::from_slice(&fs::read(f.root.join("work.yaml")).unwrap()).unwrap();
+    ledger["work_items"][0]["status"] = json!("in_progress");
+    fs::write(
+        f.root.join("work.yaml"),
+        serde_json::to_vec(&ledger).unwrap(),
+    )
+    .unwrap();
+    f.reindex();
+    let status = checked(
+        call(&client, "awr_project_status", json!({"view":"full"})).await,
+        "current status",
+    );
+    assert!(status["current"][0].get("spec_refs_count").is_none());
+    assert!(status["current"][0].get("spec_refs").is_none());
+    assert!(serde_json::to_vec(&status).unwrap().len() < 20000);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn specification_association_diagnostics_do_not_infer_or_gate_coverage() {
+    let f = Fixture::new();
+    let metadata = json!({"id":"SPEC","status":"accepted","affected_keys":["LISTED"],"specification":{"version":"one","items":[{"id":"R","disposition":"required"},{"id":"F","disposition":"future"}]}});
+    let document = format!(
+        "---\n{metadata}\n---\n# Requirements\n\n## Requirements\nUse the declared requirements.\n"
+    );
+    fs::write(f.root.join("decisions/spec.md"), &document).unwrap();
+    let ledger = json!({"work_items":[{"id":"W","status":"planned","spec_refs":[{"specification":"SPEC","item":"R","source_fingerprint":awr_source::fingerprint(document.as_bytes())}]},{"id":"LISTED","status":"planned"}]});
+    fs::write(
+        f.root.join("work.yaml"),
+        serde_json::to_vec(&ledger).unwrap(),
+    )
+    .unwrap();
+    f.reindex();
+    let client = f.client().await;
+    let before = f.logical_state();
+    let result = success(call(&client, "awr_spec_check", json!({"spec":"SPEC","limit":6})).await);
+    assert_eq!(result["status"], "needs_review");
+    assert_eq!(result["references"][0]["status"], "current");
+    assert_eq!(result["counts"]["covered"], 1);
+    assert_eq!(result["counts"]["uncovered"], 1);
+    assert_eq!(
+        result["association_diagnostics"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(result["source_warnings"], 1);
+    assert_eq!(result["source_refresh_performed"], false);
+    let (store, _) = f.store();
+    let expected = awr_runtime::check_specifications(
+        &store,
+        &f.root,
+        &awr_runtime::SpecificationCheckRequest {
+            spec: Some("SPEC".into()),
+            limit: 6,
+        },
+    )
+    .unwrap();
+    for (key, value) in expected.as_object().unwrap() {
+        assert_eq!(&result[key], value, "{key}");
+    }
+    drop(store);
+    error(
+        call(&client, "awr_spec_check", json!({"spec":"SPEC","limit":5})).await,
+        "BudgetExceeded",
+    );
+    assert_eq!(f.logical_state(), before);
+    assert_eq!(
+        fs::read_to_string(f.root.join("decisions/spec.md")).unwrap(),
+        document
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn specification_supersession_stays_unknown_without_a_document_chain() {
+    let f = Fixture::new();
+    for (key, status) in [("OLD", "superseded"), ("NEW", "accepted")] {
+        let metadata = json!({"id":key,"status":status,"affected_keys":[],"superseded_by":if key=="OLD" {json!({"source_id":Id::new(),"external_key":"MISSING","source_fingerprint":format!("sha256:{}","a".repeat(64))})}else{Value::Null},"specification":{"version":"one","items":[{"id":"R","disposition":"required"}]}});
+        fs::write(f.root.join(format!("decisions/{key}.md")),format!("---\n{metadata}\n---\n# Specification\n\n## Decision\nUse the explicit requirement.\n")).unwrap();
+    }
+    f.reindex();
+    let client = f.client().await;
+    let before = f.logical_state();
+    let result = success(call(&client, "awr_spec_check", json!({"spec":"OLD"})).await);
+    assert_eq!(result["status"], "unknown");
+    assert_eq!(
+        result["specifications"][0]["diagnostic"],
+        "specification_superseded"
+    );
+    assert_eq!(result["requirements"].as_array().unwrap().len(), 1);
+    assert_eq!(result["requirements"][0]["status"], "unknown");
+    assert_eq!(f.logical_state(), before);
+    client.cancel().await.unwrap();
+}
+
 fn error(result: CallToolResult, expected: &str) -> Value {
     assert_eq!(result.is_error, Some(true), "{result:?}");
     let value = body(&result);

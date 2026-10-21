@@ -25,16 +25,29 @@ Do not copy the L0 tutorial here. Do not add `--client cursor`. Do not run
 
 ## MCP merge paths
 
-This note describes published **AWR 0.5.1** and the current source tree. Both
-expose grouped `awr_query`. The **0.4.0** package does not. Install 0.5.1, or
-build `awr` and `awr-mcp` from this repository using
+This note describes published **AWR 0.6.0** and the current source tree. Both
+expose grouped `awr_query`. The **0.4.0** package does not. **0.5.1** already
+grouped the catalog; install 0.6.0 for schema 14 and
+`session start --client/--conversation`. Install 0.6.0, or build `awr` and
+`awr-mcp` from this repository using
 [the repository instructions](../../../README.md), then point `command` at that
 binary (absolute path):
 
 ```sh
+npm install -g @originoneai/agent-work-runtime@0.6.0
+# or: python -m pip install agent-work-runtime==0.6.0
+# or from this tree:
 cargo build --locked -p awr-cli -p awr-mcp
 # binaries: target/debug/awr and target/debug/awr-mcp
 ```
+
+0.5.1 projects use SQLite schema 7. 0.6.0 migrates **7 → 14** on the first
+explicit database write, normally `awr source reindex`. Back up `.awr/state.db`
+first. Older binaries refuse schema 14. See
+[AWR 0.6.0](../release/0.6.0.md) and
+[Upgrading from 0.5.x](../release/DISTRIBUTIONS.md#upgrading-from-05x-schema-7--14).
+0.6.0 packages compile Team code but leave it off unless enabled; this Cursor
+note stays on personal CLI/MCP.
 
 Initialize the project before starting the server. Merge
 [the stdio template](../../../examples/cursor/mcp.json.example) into **one** of:
@@ -86,15 +99,34 @@ so you never bind the literal `cursor:`:
 ```sh
 : "${HOST_CONVERSATION_ID:?set the native host conversation ID first}"
 AWR_EXTERNAL="cursor:${HOST_CONVERSATION_ID}"
+```
+
+0.6.0 records two distinct bindings. Matching external strings do not join them;
+the shared AWR session ID is the explicit bridge. For Cursor stdio MCP, create
+the MCP-bound session first (`--client stdio` is the local `awr-mcp` namespace,
+not a hook dialect), then attach local continuity:
+
+```sh
+AWR_REV=$(awrj status | jq -er '.project_revision')
+awrj session start --work "$AWR_WORK" --agent "$AWR_AGENT" \
+  --provider generic --model "$AWR_MODEL" --claim --ttl-ms 3600000 \
+  --client stdio --conversation "$AWR_EXTERNAL" \
+  --expected-revision "$AWR_REV" > "$AWR_NOTES/start.json"
+AWR_SESSION=$(jq -er '.session.id' "$AWR_NOTES/start.json")
 awrj client bind --client generic --external-session "$AWR_EXTERNAL" \
   --work "$AWR_WORK" --session "$AWR_SESSION"
 ```
 
-`--session` attaches to an **active** AWR session. For handoff, take the L0
-two-step path (`session resume`, then `bind --session`). `bind --from-session`
-creates a successor, does not carry the claim, and requires replacing
-`AWR_SESSION` from the receipt. `--client` is required. `--client cursor` is
-`InvalidInput`. `awr client install --client cursor` is `Unsupported`.
+`--session` on `client bind` attaches to an **active** AWR session. For handoff,
+take the L0 two-step path (`session resume`, then `bind --session`).
+`bind --from-session` creates a successor, does not carry the claim, and requires
+replacing `AWR_SESSION` from the receipt. See the
+[host contract](../reference/host-contract.md#share-one-awr-session-between-local-continuity-and-mcp).
+
+`--client` is required on every `client` subcommand. `--client cursor` is
+`InvalidInput`. `awr client install --client cursor` is `Unsupported`. Do not
+pass `--client cursor` on `session start` either: local stdio MCP uses
+`--client stdio`; local continuity uses `--client generic`.
 
 `--provider cursor` on `session start` is a display label only.
 
@@ -140,6 +172,7 @@ spoken to over stdio (initialize, then the default catalog):
    project `AWR example`, `EXAMPLE-001` ready,
    `freshness_basis: source_verified_readonly`
 
-That is the grouped Cursor route against this source build. It is not a Cursor
-Agent Window recheck, Cloud Agent run, hook activation, model turn, or business
-acceptance.
+That is the grouped Cursor route against this source build. 0.6.0 still defaults
+to the same eight domain tools and grouped `awr_query`, so the route still
+applies. It is not a Cursor Agent Window recheck, a 0.6.0 live catalog replay,
+Cloud Agent run, hook activation, model turn, or business acceptance.

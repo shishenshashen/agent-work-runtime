@@ -660,6 +660,49 @@ test('recovery inspect is forwarded with a validated session', async () => {
   }
 });
 
+test('event show is forwarded with a validated id and a bounded --full read', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awr-argv-'));
+  const argvLog = path.join(dir, 'argv.jsonl');
+  let b;
+  try {
+    b = await startBridge({ env: { STUB_ARGV_OUT: argvLog } });
+    const shown = await (await fetch(`${b.base}/api/event?id=21`, { headers: GUARD })).json();
+    assert.equal(shown.ok, true, JSON.stringify(shown));
+    assert.equal(shown.data.payload_included, true);
+    assert.equal(shown.data.event.event_type, 'session_started');
+    assert.match(shown.command, /event show 21 --full --max-bytes 65536/);
+    const calls = fs.readFileSync(argvLog, 'utf8').trim().split('\n').map(JSON.parse);
+    const args = calls.find((row) => row.includes('event') && row.includes('show'));
+    assert.ok(args);
+    assert.equal(args[args.indexOf('show') + 1], '21');
+    assert.deepEqual(args.slice(args.indexOf('--full'), args.indexOf('--max-bytes') + 2), ['--full', '--max-bytes', '65536']);
+  } finally {
+    if (b) await b.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('event show rejects a missing or invalid id before execution', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awr-argv-'));
+  const argvLog = path.join(dir, 'argv.jsonl');
+  let b;
+  try {
+    b = await startBridge({ env: { STUB_ARGV_OUT: argvLog } });
+    const before = fs.existsSync(argvLog) ? fs.readFileSync(argvLog, 'utf8') : '';
+    for (const pathName of ['/api/event', '/api/event?id=', '/api/event?id=bad%20id']) {
+      const invalid = await (await fetch(`${b.base}${pathName}`, { headers: GUARD })).json();
+      assert.equal(invalid.ok, false);
+      assert.equal(invalid.error.code, 'BadRequest');
+      assert.ok(!invalid.command, 'Do not spawn a child process');
+    }
+    const after = fs.existsSync(argvLog) ? fs.readFileSync(argvLog, 'utf8') : '';
+    assert.equal(after, before, 'Do not spawn a child process');
+  } finally {
+    if (b) await b.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('recovery inspect rejects a missing or invalid session before execution', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awr-argv-'));
   const argvLog = path.join(dir, 'argv.jsonl');

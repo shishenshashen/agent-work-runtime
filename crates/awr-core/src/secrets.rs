@@ -53,38 +53,34 @@ static ENV_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 // A complete, single-line legend describes literal values rather than exporting
-// variables. Require exact literal names and a known state label per clause;
-// arbitrary values, shell syntax and incomplete clauses do not qualify. A short
-// Han phrase is accepted as a label too, because field notes gloss booleans with
-// words such as `无附件` or `历史未设置` rather than only `enabled`/`开启`.
+// variables. Require exact literal names and a listed state label per clause;
+// arbitrary values, shell syntax and incomplete clauses do not qualify.
+//
+// The label set is a closed list on purpose. A pattern such as `[\p{Han}]{1,12}`
+// would also accept personal data ("客户身份证号", "王五的家庭住址"), which must
+// still be refused, so new glosses are added one literal at a time.
+const GLOSS_PHRASES: &[&str] = &[
+    "无附件",
+    "有附件",
+    "历史未设置",
+    "未设置",
+    "已设置",
+    "已开启",
+    "已关闭",
+    "关闭同库位多目的地",
+];
 static LITERAL_GLOSS: LazyLock<Regex> = LazyLock::new(|| {
-    let label = r"(?i:enabled|disabled|unset|on|off|yes|no|empty|missing|unknown)|未设置|开启|关闭|[\p{Han}]{1,12}";
-    let clause = format!(r"(?:TRUE|FALSE|NULL) *= *({label})");
+    let mut labels = vec![
+        r"(?i:enabled|disabled|unset|on|off|yes|no|empty|missing|unknown)".to_string(),
+        "未设置".to_string(),
+        "开启".to_string(),
+        "关闭".to_string(),
+    ];
+    labels.extend(GLOSS_PHRASES.iter().map(|phrase| regex::escape(phrase)));
+    let clause = format!("(?:TRUE|FALSE|NULL) *= *({})", labels.join("|"));
     Regex::new(&format!(r"\A *;? *{clause}(?: *; *{clause})* *\z"))
         .expect("fixed complete literal gloss pattern")
 });
-
-// Vocabulary that names a credential rather than describing a field. A phrase
-// carrying one of these words is data, not a gloss, so it cannot earn the
-// environment-dump exemption however short it is.
-const GLOSS_SENSITIVE_WORDS: &[&str] = &[
-    "密码", "密碼", "口令", "令牌", "密钥", "密鑰", "私钥", "私鑰", "秘密", "私有", "凭据", "憑據",
-    "凭证", "憑證", "私密",
-];
-
-/// Reports whether `text` is a complete legend whose every value is public.
-fn is_complete_literal_gloss(text: &str) -> bool {
-    let Some(captures) = LITERAL_GLOSS.captures(text) else {
-        return false;
-    };
-    (1..captures.len()).all(|index| {
-        captures.get(index).is_none_or(|value| {
-            !GLOSS_SENSITIVE_WORDS
-                .iter()
-                .any(|word| value.as_str().contains(word))
-        })
-    })
-}
 
 // Only complete, value-free declarations qualify. A bare YAML field, object
 // literal, initializer, literal type or arbitrary type expression does not.
@@ -613,7 +609,7 @@ fn sensitive_matches(text: &str, limit: usize) -> Vec<(SensitiveCategory, usize)
     // Classify the entire text, not individual matches: a public literal prefix
     // must never hide a later HOME assignment or export. The independent secret
     // and explicit environment-block checks still apply to every input.
-    let literal_gloss = is_complete_literal_gloss(text);
+    let literal_gloss = LITERAL_GLOSS.is_match(text);
     for m in ENV_ASSIGNMENT.find_iter(text).filter(|m| {
         !literal_gloss
             && environment_assignment(text, m.as_str(), m.start())
@@ -1616,15 +1612,27 @@ mod tests {
             "FALSE=无附件；TRUE=有附件",
             "FALSE=关闭同库位多目的地；TRUE=开启",
             "NULL=历史未设置",
+            "TRUE=已设置",
+            "FALSE=已关闭; TRUE=已开启",
         ] {
             ensure_public_text(text).unwrap_or_else(|e| panic!("{text}: {e}"));
         }
+    }
+
+    #[test]
+    fn boolean_glosses_still_refuse_environment_and_personal_data() {
         for text in [
             "export FALSE=disabled",
             "FALSE=disabled; HOME=/synthetic-private-value",
             "FALSE=disabled; TRUE=sk-synthetic-private-value",
             "environment:\n  FALSE=disabled",
             "FALSE=这是秘密",
+            "FALSE=这是凭据；TRUE=有附件",
+            "FALSE=客户身份证号",
+            "FALSE=王五的家庭住址",
+            "FALSE=客户手机号",
+            "FALSE=绑定银行卡",
+            "FALSE=李四的银行卡号",
         ] {
             assert!(ensure_public_text(text).is_err(), "{text}");
         }

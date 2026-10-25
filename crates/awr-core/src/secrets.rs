@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{borrow::Cow, cell::OnceCell, sync::LazyLock};
 
-pub const SECRET_POLICY_VERSION: u32 = 8;
+pub const SECRET_POLICY_VERSION: u32 = 9;
 pub const SENSITIVE_CONTENT_WITHHELD: &str = "[sensitive content withheld]";
 const REJECTION: &str =
     "sensitive content is not accepted; remove secret values or use explicit redacted placeholders";
@@ -1636,6 +1636,12 @@ mod tests {
             "FALSE=员工工号",
             "FALSE=患有糖尿病",
             "FALSE=这是凭据",
+            // The maintainer's probes on #375: mixed-case credential-shaped letter
+            // strings carry no listed phrase, so the closed list refuses them without
+            // any entropy or case-alternation heuristic.
+            "FALSE=xKqZmPwRtYvBnLsDfGhJaQ",
+            "TRUE=ghpxKqZmPwRtYvBnLsDfGhJaQeUi",
+            "FALSE=hunter; TRUE=admin",
         ] {
             assert!(ensure_public_text(text).is_err(), "{text}");
         }

@@ -56,7 +56,7 @@ class SecretTransports(unittest.TestCase):
             "event_type": "work.observed", "summary": "password: " + SENTINEL})
         self.assertEqual(result["code"], "RuleViolation")
         self.assertEqual(result["details"]["category"], "labelled_value")
-        self.assertEqual(result["details"]["policy_version"], 8)
+        self.assertEqual(result["details"]["policy_version"], 9)
         self.assertIn("outside registered sources", result["details"]["next_action"])
         public_schema = "# Deliver useful analysis\n\ninterface Login { password: string; }\n"
         (self.root / "goal.md").write_text(public_schema)

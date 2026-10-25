@@ -479,6 +479,13 @@ fn labelled_unicode_environment_private_prompt_and_recognizable_tokens_reach_rea
 fn prior_content_caches_are_rebuilt_without_rewriting_authority() {
     for (policy, authority, cached, expected) in [
         (
+            10,
+            "FALSE=无附件；TRUE=有附件",
+            "[redacted]",
+            "FALSE=无附件；TRUE=有附件",
+        ),
+        (10, "NULL=历史未设置", "[redacted]", "NULL=历史未设置"),
+        (
             9,
             "FALSE=disabled; TRUE=enabled; NULL=未设置",
             "[redacted]",
@@ -612,7 +619,7 @@ fn legacy_search_redacts_summaries_omits_sensitive_identity_and_rebuilds_the_old
             },
         )
         .unwrap();
-    assert_eq!(report.index_policy_version, 10);
+    assert_eq!(report.index_policy_version, 11);
     let hit = report.hits.iter().find(|h| h.external_key == "W").unwrap();
     assert_eq!(hit.summary, "[redacted]");
     assert!(!serde_json::to_string(&report).unwrap().contains(SENTINEL));

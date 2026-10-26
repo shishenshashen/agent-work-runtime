@@ -660,6 +660,59 @@ test('recovery inspect is forwarded with a validated session', async () => {
   }
 });
 
+test('compaction inspect is forwarded with a validated session and no write flags', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awr-argv-'));
+  const argvLog = path.join(dir, 'argv.jsonl');
+  let b;
+  try {
+    b = await startBridge({ env: { STUB_ARGV_OUT: argvLog } });
+    const shown = await (await fetch(
+      `${b.base}/api/compaction?session=11&include-observation=1`,
+      { headers: GUARD }
+    )).json();
+    assert.equal(shown.ok, true, JSON.stringify(shown));
+    assert.equal(shown.data.read_only, true);
+    assert.equal(shown.data.session_switch_performed, false);
+    assert.equal(shown.data.state, 'continue');
+    assert.equal(shown.data.post_compaction_percent, 42.0);
+    assert.equal(shown.data.observation, undefined);
+    assert.match(shown.command, /session compaction inspect --session 11/);
+    assert.doesNotMatch(shown.command, /include-observation/);
+    assert.doesNotMatch(shown.command, /observe|defer/);
+    const calls = fs.readFileSync(argvLog, 'utf8').trim().split('\n').map(JSON.parse);
+    const args = calls.find((row) => row.includes('compaction') && row.includes('inspect'));
+    assert.ok(args);
+    assert.deepEqual(args.slice(args.indexOf('--session'), args.indexOf('--session') + 2), ['--session', '11']);
+    assert.ok(!args.includes('--include-observation'));
+    assert.ok(!args.includes('observe'));
+    assert.ok(!args.includes('defer'));
+  } finally {
+    if (b) await b.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('compaction inspect rejects a missing or invalid session before execution', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awr-argv-'));
+  const argvLog = path.join(dir, 'argv.jsonl');
+  let b;
+  try {
+    b = await startBridge({ env: { STUB_ARGV_OUT: argvLog } });
+    const before = fs.existsSync(argvLog) ? fs.readFileSync(argvLog, 'utf8') : '';
+    for (const pathName of ['/api/compaction', '/api/compaction?session=', '/api/compaction?session=bad%20id']) {
+      const invalid = await (await fetch(`${b.base}${pathName}`, { headers: GUARD })).json();
+      assert.equal(invalid.ok, false);
+      assert.equal(invalid.error.code, 'BadRequest');
+      assert.ok(!invalid.command, 'Do not spawn a child process');
+    }
+    const after = fs.existsSync(argvLog) ? fs.readFileSync(argvLog, 'utf8') : '';
+    assert.equal(after, before, 'Do not spawn a child process');
+  } finally {
+    if (b) await b.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('event show is forwarded with a validated id and a bounded --full read', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awr-argv-'));
   const argvLog = path.join(dir, 'argv.jsonl');

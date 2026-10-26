@@ -310,6 +310,28 @@
       },
     },
 
+    compactionInspects: {
+      101: {
+        ok: true,
+        version: 1,
+        read_only: true,
+        session: 101,
+        state: 'continue',
+        observation_event_id: 31,
+        post_compaction_percent: 42.0,
+        previous_delta_percentage_points: null,
+        policy: { post_compaction_threshold_percent: 50 },
+        guidance: {
+          when: i18n.t('demo.compaction_when'),
+          basis: i18n.t('demo.compaction_basis'),
+          next_action: i18n.t('demo.compaction_next'),
+          recheck: i18n.t('demo.compaction_recheck'),
+        },
+        native_compaction: 'unchanged',
+        session_switch_performed: false,
+      },
+    },
+
     recoveryInspects: {
       101: {
         session: { id: 101, agent_id: 'lin', status: 'active', work_item_id: 1 },

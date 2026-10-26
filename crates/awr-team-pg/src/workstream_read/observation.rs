@@ -11,6 +11,32 @@ pub(super) async fn read(
     ownership: i64,
     requested_session: Option<&str>,
 ) -> PgResult<Value> {
+    let (data, _) = read_for_prepare(
+        tx,
+        tenant,
+        project,
+        auth,
+        work,
+        stream,
+        ownership,
+        requested_session,
+    )
+    .await?;
+    Ok(data)
+}
+
+/// Return observation facts plus private command inputs. The inputs never enter
+/// the observation body and callers attach them only after final guidance wins.
+pub(super) async fn read_for_prepare(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    project: &str,
+    auth: &ReaderAuthority,
+    work: &str,
+    stream: &str,
+    ownership: i64,
+    requested_session: Option<&str>,
+) -> PgResult<(Value, Option<super::guidance::NextCommandInputs>)> {
     // The caller has resolved current snapshot ownership and WorkRead authority.
     // Do not change work.prepare's context hash or weaken receipt visibility.
     let contract_row = tx
@@ -61,7 +87,8 @@ pub(super) async fn read(
         .await?
         .map_or(Value::Null, |r| json!(r.get::<_, String>(0)));
     let session = tx.query_opt("SELECT s.id,s.actor_id,a.display_name,s.client_id,s.state,c.id,
-          c.contract_hash,c.next_action,c.open_loops_json,(extract(epoch FROM c.created_at)*1000)::bigint
+          c.contract_hash,c.next_action,c.open_loops_json,(extract(epoch FROM c.created_at)*1000)::bigint,
+          s.session_version
         FROM awr_team.sessions s LEFT JOIN awr_team.actors a ON a.tenant_id=s.tenant_id AND a.id=s.actor_id
         LEFT JOIN awr_team.checkpoints c ON c.tenant_id=s.tenant_id AND c.project_id=s.project_id
           AND c.session_id=s.id AND c.id=s.latest_checkpoint_id
@@ -73,14 +100,21 @@ pub(super) async fn read(
           AND cl.expires_at>clock_timestamp()) DESC, (s.state='active') DESC,
           c.created_at DESC NULLS LAST, s.id DESC LIMIT 1",
         &[&tenant,&project,&work,&stream,&ownership,&requested_session,&auth.epoch]).await?;
+    let mut selected_session_id = None;
+    let mut selected_session_version = None;
+    let mut selected_claim = None;
     let mut data = json!({"work_id":work,"workstream_id":stream,"contract_hash":contract,"observed_at_unix_ms":observed,
         "definition_state":definition_state,
         "runtime":runtime,"responsibility":responsibility,"session":null,"checkpoint":null,"claim":null,
-        "execution":null,"pr_deliveries":[],"client":null,"progress":null,"model":null,"usage":null,
+        "execution":null,"session_execution":null,"last_participation":null,
+        "observation_scope":if requested_session.is_some(){"requested_session"}else{"current_work_ownership"},
+        "pr_deliveries":[],"client":null,"progress":null,"model":null,"usage":null,
         "missing":{"model":"no_session","usage":"no_session","progress":"no_session"},
         "execution_authorized":false,"automatic_resume":false});
     if let Some(s) = session {
         let session_id: String = s.get(0);
+        selected_session_id = Some(session_id.clone());
+        selected_session_version = Some(s.get::<_, i64>(10).to_string());
         data["session"] = json!({"id":session_id,"actor_id":s.get::<_,String>(1),
             "actor_name":s.get::<_,Option<String>>(2),"client_id":s.get::<_,String>(3),"state":s.get::<_,String>(4)});
         if let Some(checkpoint) = s.get::<_, Option<String>>(5) {
@@ -93,30 +127,96 @@ pub(super) async fn read(
             tenant,
             project,
             &session_id,
+            work,
+            stream,
+            ownership,
+            requested_session,
             &contract,
             observed,
             &mut data,
         )
         .await?;
-        data["claim"] = tx.query_opt("SELECT id,state,expires_at>clock_timestamp(),coordinator_epoch,
-              (extract(epoch FROM expires_at)*1000)::bigint
+        let claim = tx.query_opt("SELECT id,state,expires_at>clock_timestamp(),coordinator_epoch,
+              (extract(epoch FROM expires_at)*1000)::bigint,fence,lease_version
             FROM awr_team.claims WHERE tenant_id=$1 AND project_id=$2 AND scope_id='main' AND work_id=$3
               AND workstream_id=$4 AND ownership_version=$5 AND session_id=$6
             ORDER BY acquired_at DESC,id DESC LIMIT 1", &[&tenant,&project,&work,&stream,&ownership,&session_id]).await?
-            .map(|r| {let current=r.get::<_,Option<String>>(3).as_deref()==Some(&auth.epoch);
-                json!({"id":r.get::<_,String>(0),"state":r.get::<_,String>(1),
-                    "lease_live":r.get::<_,String>(1)=="active" && r.get::<_,bool>(2) && current,
-                    "epoch_matches_current":current,"expires_at_unix_ms":r.get::<_,i64>(4)})}).unwrap_or(Value::Null);
+            ;
+        data["claim"] = if let Some(r) = claim {
+            let current = r.get::<_, Option<String>>(3).as_deref() == Some(&auth.epoch);
+            let claim_id = r.get::<_, String>(0);
+            selected_claim = Some((
+                claim_id.clone(),
+                r.get::<_, i64>(5).to_string(),
+                r.get::<_, i64>(6).to_string(),
+            ));
+            json!({"id":claim_id,"state":r.get::<_,String>(1),
+                "lease_live":r.get::<_,String>(1)=="active" && r.get::<_,bool>(2) && current,
+                "epoch_matches_current":current,"expires_at_unix_ms":r.get::<_,i64>(4)})
+        } else {
+            Value::Null
+        };
         if let Some(e) = tx.query_opt("SELECT id FROM awr_team.executions WHERE tenant_id=$1 AND project_id=$2
             AND scope_id='main' AND work_id=$3 AND workstream_id=$4 AND ownership_version=$5 AND session_id=$6
             ORDER BY id DESC LIMIT 1", &[&tenant,&project,&work,&stream,&ownership,&session_id]).await? {
-            data["execution"] = crate::workstream_command::executions::inspect(
+            let execution = crate::workstream_command::executions::inspect(
                 tx,tenant,project,auth,work,stream,ownership,&e.get::<_,String>(0),Some(&session_id)).await?;
-            if data["execution"]["receipt_details_available"] == false {
-                data["missing"]["execution_receipt"] = json!("permission_restricted");
+            // Only guidance inputs are repeated, never raw receipt payloads.
+            let mut summary = serde_json::Map::new();
+            for key in ["execution_id", "state", "effects_settled", "contract_matches_current",
+                "epoch_matches_current", "lease_live", "owned_by_client", "cancel_requested",
+                "recovery_blocked", "previous_epoch_review_required", "controlled_confirmation_available"] {
+                summary.insert(key.into(), execution[key].clone());
             }
+            // Guidance only needs presence; the full declaration stays on execution.
+            summary.insert("terminal_reporting".into(), if execution["terminal_reporting"].is_object() {
+                json!({})
+            } else { Value::Null });
+            data["session_execution"] = Value::Object(summary);
+            data["execution"] = execution;
         }
     }
+    // Select execution independently: a newer reviewer session must not hide
+    // the developer's result. The existing inspector still filters raw receipts.
+    if let Some(e) = tx.query_opt("SELECT e.id,e.session_id,e.executor_actor_id,e.executor_client_id,a.display_name
+        FROM awr_team.executions e LEFT JOIN awr_team.actors a
+          ON a.tenant_id=e.tenant_id AND a.id=e.executor_actor_id
+        WHERE e.tenant_id=$1 AND e.project_id=$2 AND e.scope_id='main' AND e.work_id=$3
+          AND e.workstream_id=$4 AND e.ownership_version=$5 AND ($6::text IS NULL OR e.session_id=$6)
+        ORDER BY e.id DESC LIMIT 1", &[&tenant,&project,&work,&stream,&ownership,&requested_session]).await? {
+        let id: String = e.get(0);
+        if data["execution"]["execution_id"].as_str() != Some(&id) {
+            data["execution"] = crate::workstream_command::executions::inspect(
+                tx,tenant,project,auth,work,stream,ownership,&id,requested_session).await?;
+        }
+        data["execution"]["origin"] = json!({"session_id":e.get::<_,Option<String>>(1),
+            "actor_id":e.get::<_,String>(2),"client_id":e.get::<_,Option<String>>(3),
+            "actor_name":e.get::<_,Option<String>>(4),"basis":"recorded_execution_identity",
+            "model":null,"model_basis":"not_recorded_at_execution"});
+        if data["execution"]["receipt_details_available"] == false {
+            data["missing"]["execution_receipt"] = json!("permission_restricted");
+        }
+    }
+    // Latest participation is ordered by committed session events, not by
+    // lease priority. Checkpoint revision is a fallback for imported sessions.
+    data["last_participation"] = tx.query_opt("SELECT s.id,s.actor_id,a.display_name,s.client_id,s.state,
+            GREATEST(ev.project_revision,c.observed_revision),
+            (extract(epoch FROM COALESCE(ev.created_at,c.created_at))*1000)::bigint
+        FROM awr_team.sessions s LEFT JOIN awr_team.actors a ON a.tenant_id=s.tenant_id AND a.id=s.actor_id
+        LEFT JOIN awr_team.checkpoints c ON (c.tenant_id,c.project_id,c.id)=(s.tenant_id,s.project_id,s.latest_checkpoint_id)
+        LEFT JOIN LATERAL (SELECT e.project_revision,e.created_at FROM awr_team.events e
+          WHERE e.tenant_id=s.tenant_id AND e.project_id=s.project_id AND e.work_id=s.work_id
+            AND e.workstream_id=s.workstream_id AND e.actor_id=s.actor_id AND e.payload_json->>'session_id'=s.id
+          ORDER BY e.project_revision DESC,e.event_index DESC LIMIT 1) ev ON true
+        WHERE s.tenant_id=$1 AND s.project_id=$2 AND s.scope_id='main' AND s.work_id=$3
+          AND s.workstream_id=$4 AND s.ownership_version=$5 AND ($6::text IS NULL OR s.id=$6)
+          AND (ev.project_revision IS NOT NULL OR c.observed_revision IS NOT NULL)
+        ORDER BY GREATEST(ev.project_revision,c.observed_revision) DESC NULLS LAST,s.id DESC LIMIT 1",
+        &[&tenant,&project,&work,&stream,&ownership,&requested_session]).await?
+        .map(|r|json!({"session_id":r.get::<_,String>(0),"actor_id":r.get::<_,String>(1),
+            "actor_name":r.get::<_,Option<String>>(2),"client_id":r.get::<_,String>(3),"state":r.get::<_,String>(4),
+            "recorded_project_revision":r.get::<_,Option<i64>>(5).map(|v|v.to_string()),
+            "at_unix_ms":r.get::<_,Option<i64>>(6),"basis":"latest_recorded_session_activity"})).unwrap_or(Value::Null);
     let deliveries = tx.query("SELECT id,pr_url,head_sha,gh_submitted,gh_approved,gh_merged,
         contract_hash,state,fact_source,observed_at,test_evidence_id FROM awr_team.pr_deliveries
         WHERE tenant_id=$1 AND project_id=$2 AND work_id=$3 ORDER BY created_at DESC,id DESC LIMIT 5",
@@ -147,6 +247,18 @@ pub(super) async fn read(
         tx, tenant, project, auth, work, &contract, ownership,
     ))
     .await?;
+    Box::pin(super::inbox::observe_source(
+        tx,
+        tenant,
+        project,
+        auth,
+        work,
+        &mut data["collaboration"],
+    ))
+    .await?;
+    if data["collaboration"]["source_state"]["observation"] != "not_measured" {
+        data["collaboration"]["source_state"]["query_started_at_unix_ms"] = json!(observed);
+    }
     let ready = Box::pin(crate::workstream_command::task_intake::dependencies_ready(
         tx, tenant, project, auth, work, stream,
     ))
@@ -158,6 +270,63 @@ pub(super) async fn read(
         &data,
         super::guidance::with_collaboration(&data, true, owns_session, role_hint),
     );
-    data["guidance"] = super::guidance::authorized(auth, stream_id, work, hint);
-    Ok(data)
+    let hint = super::guidance::authorized(auth, stream_id, work, hint);
+    let expected_authority_version = auth.catalog.get(stream_id)?.authority_version.to_string();
+    let inputs =
+        if hint["code"] == "prepare_execution" && hint["action"]["op"] == "execution.prepare" {
+            selected_session_id
+                .zip(selected_session_version)
+                .zip(selected_claim)
+                .zip(data["runtime"]["work_version"].as_str())
+                .map(
+                    |(
+                        (
+                            (session_id, expected_session_version),
+                            (claim_id, expected_fence, expected_lease_version),
+                        ),
+                        expected_work_version,
+                    )| {
+                        super::guidance::NextCommandInputs::ExecutionPrepare(
+                            super::guidance::NextExecutionPrepareInputs {
+                                workstream_id: stream_id,
+                                work_id: work.to_string(),
+                                coordinator_epoch: auth.epoch.clone(),
+                                expected_project_revision: auth.revision.to_string(),
+                                expected_authority_version: expected_authority_version.clone(),
+                                expected_ownership_version: ownership.to_string(),
+                                expected_contract_hash: contract.clone(),
+                                session_id,
+                                expected_session_version,
+                                claim_id,
+                                expected_fence,
+                                expected_lease_version,
+                                expected_work_version: expected_work_version.to_string(),
+                            },
+                        )
+                    },
+                )
+        } else if owns_session && hint["action"]["op"] == "session.checkpoint" {
+            selected_session_id.zip(selected_session_version).map(
+                |(session_id, expected_session_version)| {
+                    super::guidance::NextCommandInputs::SessionCheckpoint(
+                        super::guidance::NextSessionCheckpointInputs {
+                            workstream_id: stream_id,
+                            work_id: work.to_string(),
+                            coordinator_epoch: auth.epoch.clone(),
+                            expected_project_revision: auth.revision.to_string(),
+                            expected_authority_version: expected_authority_version.clone(),
+                            expected_ownership_version: ownership.to_string(),
+                            expected_contract_hash: contract.clone(),
+                            session_id,
+                            expected_session_version,
+                            require_client_info: hint["code"] == "declare_client",
+                        },
+                    )
+                },
+            )
+        } else {
+            None
+        };
+    data["guidance"] = hint;
+    Ok((data, inputs))
 }

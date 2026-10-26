@@ -1,5 +1,294 @@
 //! One bounded, deterministic next-step hint. Advice never grants execution.
+use awr_core::Id;
+use serde::Serialize;
 use serde_json::{Value, json};
+
+/// The complete enriched guidance packet must fit as one value. It is never
+/// truncated because a partial command could invite callers to guess bindings.
+/// Session.checkpoint packets share this same serialized-byte bound.
+pub(crate) const EXECUTION_PREPARE_GUIDANCE_MAX_BYTES: usize = 4096;
+
+#[derive(Clone, Debug)]
+pub(crate) struct NextExecutionPrepareInputs {
+    pub workstream_id: Id,
+    pub work_id: String,
+    pub coordinator_epoch: String,
+    pub expected_project_revision: String,
+    pub expected_authority_version: String,
+    pub expected_ownership_version: String,
+    pub expected_contract_hash: String,
+    pub session_id: String,
+    pub expected_session_version: String,
+    pub claim_id: String,
+    pub expected_fence: String,
+    pub expected_lease_version: String,
+    pub expected_work_version: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NextSessionCheckpointInputs {
+    pub workstream_id: Id,
+    pub work_id: String,
+    pub coordinator_epoch: String,
+    pub expected_project_revision: String,
+    pub expected_authority_version: String,
+    pub expected_ownership_version: String,
+    pub expected_contract_hash: String,
+    pub session_id: String,
+    pub expected_session_version: String,
+    pub require_client_info: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum NextCommandInputs {
+    ExecutionPrepare(NextExecutionPrepareInputs),
+    SessionCheckpoint(NextSessionCheckpointInputs),
+}
+
+#[derive(Serialize)]
+struct CommandEnvelope<'a, Args: Serialize> {
+    protocol_version: u32,
+    op: &'static str,
+    workstream_id: Id,
+    work_id: &'a str,
+    coordinator_epoch: &'a str,
+    expected_project_revision: &'a str,
+    expected_authority_version: &'a str,
+    expected_ownership_version: &'a str,
+    expected_contract_hash: &'a str,
+    args: Args,
+}
+
+#[derive(Serialize)]
+struct ExecutionPrepareArgsBase<'a> {
+    session_id: &'a str,
+    expected_session_version: &'a str,
+    claim_id: &'a str,
+    expected_fence: &'a str,
+    expected_lease_version: &'a str,
+    expected_work_version: &'a str,
+}
+
+#[derive(Serialize)]
+struct SessionCheckpointArgsBase<'a> {
+    session_id: &'a str,
+    expected_session_version: &'a str,
+    context_hash: &'a str,
+}
+
+fn identity(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+
+fn version(value: &str, allow_zero: bool) -> bool {
+    !value.is_empty()
+        && (value == "0" || !value.starts_with('0'))
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && value
+            .parse::<i64>()
+            .is_ok_and(|parsed| parsed >= i64::from(!allow_zero))
+}
+
+fn digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn envelope_ready(
+    work_id: &str,
+    coordinator_epoch: &str,
+    expected_project_revision: &str,
+    expected_authority_version: &str,
+    expected_ownership_version: &str,
+    expected_contract_hash: &str,
+    session_id: &str,
+    expected_session_version: &str,
+) -> bool {
+    identity(work_id)
+        && identity(coordinator_epoch)
+        && version(expected_project_revision, true)
+        && version(expected_authority_version, false)
+        && version(expected_ownership_version, false)
+        && digest(expected_contract_hash)
+        && identity(session_id)
+        && version(expected_session_version, false)
+}
+
+fn execution_prepare_command_base(inputs: &NextExecutionPrepareInputs) -> Option<Value> {
+    if !envelope_ready(
+        &inputs.work_id,
+        &inputs.coordinator_epoch,
+        &inputs.expected_project_revision,
+        &inputs.expected_authority_version,
+        &inputs.expected_ownership_version,
+        &inputs.expected_contract_hash,
+        &inputs.session_id,
+        &inputs.expected_session_version,
+    ) || !identity(&inputs.claim_id)
+        || !version(&inputs.expected_fence, false)
+        || !version(&inputs.expected_lease_version, false)
+        || !version(&inputs.expected_work_version, false)
+    {
+        return None;
+    }
+    serde_json::to_value(CommandEnvelope {
+        protocol_version: 1,
+        op: "execution.prepare",
+        workstream_id: inputs.workstream_id,
+        work_id: inputs.work_id.as_str(),
+        coordinator_epoch: &inputs.coordinator_epoch,
+        expected_project_revision: &inputs.expected_project_revision,
+        expected_authority_version: &inputs.expected_authority_version,
+        expected_ownership_version: &inputs.expected_ownership_version,
+        expected_contract_hash: &inputs.expected_contract_hash,
+        args: ExecutionPrepareArgsBase {
+            session_id: &inputs.session_id,
+            expected_session_version: &inputs.expected_session_version,
+            claim_id: &inputs.claim_id,
+            expected_fence: &inputs.expected_fence,
+            expected_lease_version: &inputs.expected_lease_version,
+            expected_work_version: &inputs.expected_work_version,
+        },
+    })
+    .ok()
+}
+
+fn session_checkpoint_command_base(
+    inputs: &NextSessionCheckpointInputs,
+    context_hash: &str,
+) -> Option<Value> {
+    if !envelope_ready(
+        &inputs.work_id,
+        &inputs.coordinator_epoch,
+        &inputs.expected_project_revision,
+        &inputs.expected_authority_version,
+        &inputs.expected_ownership_version,
+        &inputs.expected_contract_hash,
+        &inputs.session_id,
+        &inputs.expected_session_version,
+    ) || !digest(context_hash)
+    {
+        return None;
+    }
+    serde_json::to_value(CommandEnvelope {
+        protocol_version: 1,
+        op: "session.checkpoint",
+        workstream_id: inputs.workstream_id,
+        work_id: inputs.work_id.as_str(),
+        coordinator_epoch: &inputs.coordinator_epoch,
+        expected_project_revision: &inputs.expected_project_revision,
+        expected_authority_version: &inputs.expected_authority_version,
+        expected_ownership_version: &inputs.expected_ownership_version,
+        expected_contract_hash: &inputs.expected_contract_hash,
+        args: SessionCheckpointArgsBase {
+            session_id: &inputs.session_id,
+            expected_session_version: &inputs.expected_session_version,
+            context_hash,
+        },
+    })
+    .ok()
+}
+
+fn attach_command_base(
+    mut hint: Value,
+    expected_op: &str,
+    selected: bool,
+    base: Option<Value>,
+    caller_slots: Value,
+    note_prefix: &str,
+) -> Value {
+    if !selected || hint["action"]["op"] != expected_op {
+        return hint;
+    }
+    let fallback = hint.clone();
+    let Some(selected_note) = hint["action"]["note"].as_str().map(str::to_owned) else {
+        return hint;
+    };
+    if let Some(base) = base {
+        hint["action"]["command_base"] = base;
+        hint["action"]["caller_slots"] = caller_slots;
+        hint["action"]["note"] = json!(format!("{note_prefix} {selected_note}"));
+    }
+    if hint["action"]["command_base"].is_null()
+        || serde_json::to_vec(&hint).map_or(true, |bytes| {
+            bytes.len() > EXECUTION_PREPARE_GUIDANCE_MAX_BYTES
+        })
+    {
+        fallback
+    } else {
+        hint
+    }
+}
+
+pub(crate) fn prepare_execution_hint() -> Value {
+    json!({"code":"prepare_execution",
+        "when":"your current live claim has no execution",
+        "because":["the active own session and current executor match task ownership"],
+        "action":{"op":"execution.prepare",
+            "note":"Prepare your execution with current work/session/claim versions, a measured input_digest and declared_scope from the contract. Preparation does not admit effects; execution.start must succeed before editing or running work."},
+        "recheck_on":"execution preparation, claim, contract, scope or authority changes"})
+}
+
+/// Attach only a complete, current server-known base to the selected action.
+/// The three caller-known fields remain absent for the caller to supply.
+pub(crate) fn with_execution_prepare_command_base(
+    hint: Value,
+    inputs: NextExecutionPrepareInputs,
+) -> Value {
+    let selected = hint["code"] == "prepare_execution";
+    attach_command_base(
+        hint,
+        "execution.prepare",
+        selected,
+        execution_prepare_command_base(&inputs),
+        json!(["request_id", "args.input_digest", "args.declared_scope"]),
+        "Use command_base unchanged. Fill exactly request_id, args.input_digest and args.declared_scope; measure input_digest from consumed inputs and choose your intended declared_scope subset from work.prepare.data.visible_contract.scope_paths under the same expected_contract_hash.",
+    )
+}
+
+/// Attach a schema-complete checkpoint envelope. Caller-measured next_action,
+/// open_loops, request_id and, when listed, client_info stay absent.
+pub(crate) fn with_session_checkpoint_command_base(
+    hint: Value,
+    inputs: NextSessionCheckpointInputs,
+    context_hash: &str,
+) -> Value {
+    let mut slots = vec!["request_id", "args.next_action", "args.open_loops"];
+    if inputs.require_client_info {
+        slots.push("args.client_info");
+    }
+    attach_command_base(
+        hint,
+        "session.checkpoint",
+        true,
+        session_checkpoint_command_base(&inputs, context_hash),
+        json!(slots),
+        "Use command_base unchanged. Fill exactly the listed caller_slots from observed facts; do not guess progress, usage, model, or unfinished work.",
+    )
+}
+
+pub(crate) fn with_command_base(
+    hint: Value,
+    inputs: NextCommandInputs,
+    context_hash: &str,
+) -> Value {
+    match inputs {
+        NextCommandInputs::ExecutionPrepare(inputs) => {
+            with_execution_prepare_command_base(hint, inputs)
+        }
+        NextCommandInputs::SessionCheckpoint(inputs) => {
+            with_session_checkpoint_command_base(hint, inputs, context_hash)
+        }
+    }
+}
+
+/// Advice belongs to the selected session. A different participant's historical
+/// execution is display evidence, not admission for the current session.
+pub(super) fn session_execution(data: &Value) -> &Value {
+    data.get("session_execution").unwrap_or(&data["execution"])
+}
 
 /// Protective execution advice retains priority over coordination and delivery.
 pub(super) fn with_collaboration(
@@ -53,7 +342,7 @@ pub(super) fn with_collaboration(
 /// approval does not reopen a settled execution or admit changes to its content.
 fn rejected_integration(data: &Value, owns_session: bool, fallback: Value) -> Value {
     let integration = &data["collaboration"]["integration"];
-    let execution = &data["execution"];
+    let execution = session_execution(data);
     if !owns_session
         || data["session"]["state"] != "active"
         || data["claim"]["lease_live"] != true
@@ -131,7 +420,7 @@ pub(super) fn authorized(
 
 pub(super) fn select(data: &Value, context_complete: bool, owns_session: bool) -> Value {
     let runtime = &data["runtime"];
-    let execution = &data["execution"];
+    let execution = session_execution(data);
     let claim = &data["claim"];
     let progress = &data["progress"];
     let execution_resolved = matches!(
@@ -323,14 +612,7 @@ pub(super) fn select(data: &Value, context_complete: bool, owns_session: bool) -
         && claim["lease_live"] == true
         && execution.is_null()
     {
-        (
-            "prepare_execution",
-            "your current live claim has no execution",
-            "the active own session and current executor match task ownership",
-            "execution.prepare",
-            "Prepare your execution with current work/session/claim versions, a measured input_digest and declared_scope from the contract. Preparation does not admit effects; execution.start must succeed before editing or running work.",
-            "execution preparation, claim, contract, scope or authority changes",
-        )
+        return prepare_execution_hint();
     } else if data["responsibility"]["relation"] == "owned_by_me"
         && data["responsibility"]["current_executor_matches_client"] == true
         && claim["state"] == "active"
@@ -370,6 +652,57 @@ pub(super) fn select(data: &Value, context_complete: bool, owns_session: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepare_inputs(identity: &str) -> NextExecutionPrepareInputs {
+        NextExecutionPrepareInputs {
+            workstream_id: Id::from(1),
+            work_id: identity.to_string(),
+            coordinator_epoch: identity.to_string(),
+            expected_project_revision: i64::MAX.to_string(),
+            expected_authority_version: i64::MAX.to_string(),
+            expected_ownership_version: i64::MAX.to_string(),
+            expected_contract_hash: "a".repeat(64),
+            session_id: identity.to_string(),
+            expected_session_version: i64::MAX.to_string(),
+            claim_id: identity.to_string(),
+            expected_fence: i64::MAX.to_string(),
+            expected_lease_version: i64::MAX.to_string(),
+            expected_work_version: i64::MAX.to_string(),
+        }
+    }
+
+    fn checkpoint_inputs(identity: &str, require_client_info: bool) -> NextSessionCheckpointInputs {
+        NextSessionCheckpointInputs {
+            workstream_id: Id::from(1),
+            work_id: identity.to_string(),
+            coordinator_epoch: identity.to_string(),
+            expected_project_revision: i64::MAX.to_string(),
+            expected_authority_version: i64::MAX.to_string(),
+            expected_ownership_version: i64::MAX.to_string(),
+            expected_contract_hash: "a".repeat(64),
+            session_id: identity.to_string(),
+            expected_session_version: i64::MAX.to_string(),
+            require_client_info,
+        }
+    }
+
+    fn declare_client_hint() -> Value {
+        json!({"code":"declare_client",
+            "when":"client capabilities have not been declared",
+            "because":["client_info is absent"],
+            "action":{"op":"session.checkpoint",
+                "note":"At the next checkpoint include known client_info and supported/unsupported/unknown observations; never guess model or usage."},
+            "recheck_on":"client, model or capability changes"})
+    }
+
+    fn report_checkpoint_hint() -> Value {
+        json!({"code":"report_at_boundary",
+            "when":"phase, tests, blocker, user wait or delivery changes",
+            "because":["session is active and no higher-priority condition was found"],
+            "action":{"op":"session.checkpoint",
+                "note":"Batch progress with next_action/open_loops and available host usage; terminal outcomes alone use execution.report. Continue only under existing admission."},
+            "recheck_on":"material work change or lease expiry"})
+    }
 
     fn active() -> Value {
         json!({"runtime":{"state":"in_progress"},"session":{"state":"active"},"client":{"product":"Agent"},
@@ -442,6 +775,24 @@ mod tests {
     }
 
     #[test]
+    fn historical_execution_does_not_admit_a_new_session_or_reuse_its_approval() {
+        let mut data = owned();
+        data["execution"] =
+            json!({"execution_id":"prior","state":"succeeded","effects_settled":true});
+        data["session_execution"] = Value::Null;
+        assert_eq!(select(&data, true, true)["code"], "prepare_execution");
+        data["collaboration"] =
+            json!({"integration":{"reviewed_execution_id":"prior","target_changed":true}});
+        let hint = json!({"code":"integration_rejected"});
+        assert_eq!(
+            with_collaboration(&data, true, true, Some(hint))["code"],
+            "prepare_execution"
+        );
+        data["session_execution"] = json!({"state":"unknown"});
+        assert_eq!(select(&data, true, true)["code"], "reconcile_execution");
+    }
+
+    #[test]
     fn current_owned_intake_connects_preparation_to_exact_admission() {
         let mut data = owned();
         let prepare = select(&data, true, true);
@@ -471,6 +822,211 @@ mod tests {
                 assert!(!hint[key].is_null());
             }
         }
+    }
+
+    #[test]
+    fn execution_prepare_packet_is_complete_and_bounded_by_serialized_bytes() {
+        let all_quotes = "\"".repeat(128);
+        let multibyte = "é".repeat(64);
+        assert_eq!(all_quotes.len(), 128);
+        assert_eq!(multibyte.len(), 128);
+        let mut tested_max = 0;
+        for identity in [all_quotes, multibyte] {
+            let hint = with_execution_prepare_command_base(
+                prepare_execution_hint(),
+                prepare_inputs(&identity),
+            );
+            let bytes = serde_json::to_vec(&hint).unwrap();
+            tested_max = tested_max.max(bytes.len());
+            assert!(bytes.len() <= EXECUTION_PREPARE_GUIDANCE_MAX_BYTES);
+            let action = &hint["action"];
+            assert_eq!(
+                action["caller_slots"],
+                json!(["request_id", "args.input_digest", "args.declared_scope"])
+            );
+            let base = &action["command_base"];
+            assert_eq!(base["op"], "execution.prepare");
+            assert!(base.get("request_id").is_none());
+            assert!(base["args"].get("input_digest").is_none());
+            assert!(base["args"].get("declared_scope").is_none());
+            assert_eq!(base["work_id"], identity);
+        }
+        eprintln!(
+            "largest tested execution-prepare guidance packet: {} bytes",
+            tested_max
+        );
+    }
+
+    #[test]
+    fn execution_prepare_packet_preserves_the_selected_action_note() {
+        let selected_note = "Keep this selected action's existing update and retest instructions.";
+        let mut hint = prepare_execution_hint();
+        hint["action"]["note"] = json!(selected_note);
+        let enriched = with_execution_prepare_command_base(hint, prepare_inputs("id"));
+        let note = enriched["action"]["note"].as_str().unwrap();
+        assert!(note.starts_with("Use command_base unchanged."));
+        assert!(note.ends_with(selected_note));
+        assert_eq!(note.matches(selected_note).count(), 1);
+        assert!(enriched["action"]["command_base"].is_object());
+    }
+
+    #[test]
+    fn execution_prepare_packet_overflow_omits_the_entire_base() {
+        let mut fallback = prepare_execution_hint();
+        fallback["when"] = json!("x".repeat(EXECUTION_PREPARE_GUIDANCE_MAX_BYTES));
+        let enriched = with_execution_prepare_command_base(fallback.clone(), prepare_inputs("id"));
+        assert_eq!(enriched, fallback);
+        assert_eq!(enriched["action"]["op"], "execution.prepare");
+        assert!(enriched["action"].get("command_base").is_none());
+        assert!(enriched["action"].get("caller_slots").is_none());
+        assert!(
+            !enriched["action"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("command_base")
+        );
+    }
+
+    fn assert_checkpoint_packet(
+        hint: &Value,
+        identity: &str,
+        context_hash: &str,
+        require_client_info: bool,
+    ) {
+        let bytes = serde_json::to_vec(hint).unwrap();
+        assert!(bytes.len() <= EXECUTION_PREPARE_GUIDANCE_MAX_BYTES);
+        let action = &hint["action"];
+        let mut slots = vec![
+            json!("request_id"),
+            json!("args.next_action"),
+            json!("args.open_loops"),
+        ];
+        if require_client_info {
+            slots.push(json!("args.client_info"));
+        }
+        assert_eq!(action["caller_slots"], json!(slots));
+        let base = &action["command_base"];
+        assert_eq!(base["protocol_version"], 1);
+        assert_eq!(base["op"], "session.checkpoint");
+        assert_eq!(base["work_id"], identity);
+        assert_eq!(base["args"]["session_id"], identity);
+        assert_eq!(base["args"]["context_hash"], context_hash);
+        assert!(base.get("request_id").is_none());
+        assert!(base["args"].get("next_action").is_none());
+        assert!(base["args"].get("open_loops").is_none());
+        assert!(base["args"].get("client_info").is_none());
+        assert!(base["args"].get("progress").is_none());
+        assert!(base["args"].get("usage").is_none());
+        assert!(base["args"].get("claim_id").is_none());
+        assert!(base["args"].get("expected_fence").is_none());
+        assert!(base["args"].get("expected_lease_version").is_none());
+        assert!(base["args"].get("expected_work_version").is_none());
+        assert!(base["args"].get("input_digest").is_none());
+        assert!(base["args"].get("declared_scope").is_none());
+    }
+
+    #[test]
+    fn session_checkpoint_packet_is_complete_and_bounded_by_serialized_bytes() {
+        let context_hash = "b".repeat(64);
+        let all_quotes = "\"".repeat(128);
+        let multibyte = "é".repeat(64);
+        assert_eq!(all_quotes.len(), 128);
+        assert_eq!(multibyte.len(), 128);
+        let mut tested_max = 0;
+        for require_client_info in [true, false] {
+            for identity in [all_quotes.clone(), multibyte.clone()] {
+                let hint = if require_client_info {
+                    declare_client_hint()
+                } else {
+                    report_checkpoint_hint()
+                };
+                let enriched = with_session_checkpoint_command_base(
+                    hint,
+                    checkpoint_inputs(&identity, require_client_info),
+                    &context_hash,
+                );
+                let bytes = serde_json::to_vec(&enriched).unwrap();
+                tested_max = tested_max.max(bytes.len());
+                assert_checkpoint_packet(&enriched, &identity, &context_hash, require_client_info);
+            }
+        }
+        eprintln!(
+            "largest tested session-checkpoint guidance packet: {} bytes",
+            tested_max
+        );
+    }
+
+    #[test]
+    fn session_checkpoint_packet_preserves_the_selected_action_note() {
+        let selected_note = "Keep this selected action's existing client declaration instructions.";
+        let mut hint = declare_client_hint();
+        hint["action"]["note"] = json!(selected_note);
+        let enriched = with_session_checkpoint_command_base(
+            hint,
+            checkpoint_inputs("id", true),
+            &"b".repeat(64),
+        );
+        let note = enriched["action"]["note"].as_str().unwrap();
+        assert!(note.starts_with("Use command_base unchanged."));
+        assert!(note.ends_with(selected_note));
+        assert_eq!(note.matches(selected_note).count(), 1);
+        assert!(enriched["action"]["command_base"].is_object());
+    }
+
+    #[test]
+    fn session_checkpoint_packet_overflow_omits_the_entire_base() {
+        let mut fallback = declare_client_hint();
+        fallback["when"] = json!("x".repeat(EXECUTION_PREPARE_GUIDANCE_MAX_BYTES));
+        let enriched = with_session_checkpoint_command_base(
+            fallback.clone(),
+            checkpoint_inputs("id", true),
+            &"b".repeat(64),
+        );
+        assert_eq!(enriched, fallback);
+        assert_eq!(enriched["action"]["op"], "session.checkpoint");
+        assert!(enriched["action"].get("command_base").is_none());
+        assert!(enriched["action"].get("caller_slots").is_none());
+        assert!(
+            !enriched["action"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("command_base")
+        );
+    }
+
+    #[test]
+    fn session_checkpoint_omits_base_for_unrelated_ops_and_invalid_context_hash() {
+        let inputs = checkpoint_inputs("id", true);
+        let hash = "b".repeat(64);
+        let execution =
+            with_session_checkpoint_command_base(prepare_execution_hint(), inputs.clone(), &hash);
+        assert_eq!(execution["action"]["op"], "execution.prepare");
+        assert!(execution["action"].get("command_base").is_none());
+        let routed = with_command_base(
+            declare_client_hint(),
+            NextCommandInputs::SessionCheckpoint(inputs.clone()),
+            &hash,
+        );
+        assert!(routed["action"]["command_base"].is_object());
+        let uppercase = "B".repeat(64);
+        let prefixed = format!("sha256:{}", "b".repeat(64));
+        for bad in ["", prefixed.as_str(), uppercase.as_str()] {
+            let omitted =
+                with_session_checkpoint_command_base(declare_client_hint(), inputs.clone(), bad);
+            assert_eq!(omitted["action"]["op"], "session.checkpoint");
+            assert!(omitted["action"].get("command_base").is_none());
+        }
+        let execution_routed = with_command_base(
+            prepare_execution_hint(),
+            NextCommandInputs::ExecutionPrepare(prepare_inputs("id")),
+            &hash,
+        );
+        assert_eq!(execution_routed["action"]["op"], "execution.prepare");
+        assert!(execution_routed["action"]["command_base"].is_object());
+        assert_eq!(
+            execution_routed["action"]["caller_slots"],
+            json!(["request_id", "args.input_digest", "args.declared_scope"])
+        );
     }
 
     #[test]

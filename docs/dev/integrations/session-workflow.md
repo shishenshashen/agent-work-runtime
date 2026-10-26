@@ -4,9 +4,26 @@ This is the **L0** operator path. It works from any coding agent's terminal
 tool, and from any MCP client that can start `awr-mcp` or reach the shared
 HTTP service. Host-specific merge paths live in [L1/L2 notes](README.md).
 
-Published AWR 0.5.1 packages include the CLI, stdio MCP, session/claim tools and
-the [shared HTTP service](../reference/mcp-service.md). The 0.4.0 package is not
-the current release.
+This page describes published **AWR 0.6.0** and the current source tree. The
+packages include the CLI, stdio MCP, session/claim tools and the
+[shared HTTP service](../reference/mcp-service.md). **0.5.1** already grouped the
+MCP catalog; install 0.6.0 for schema 14 and
+`session start --client/--conversation`. The 0.4.0 package is not the current
+release.
+
+```sh
+npm install -g @originoneai/agent-work-runtime@0.6.0
+# or: python -m pip install agent-work-runtime==0.6.0
+```
+
+0.5.1 projects use SQLite schema 7. 0.6.0 migrates **7 → 14** on the first
+explicit database write, normally `awr source reindex`. Back up `.awr/state.db`
+first. Older binaries refuse schema 14. See
+[AWR 0.6.0](../release/0.6.0.md) and
+[Upgrading from 0.5.x](../release/DISTRIBUTIONS.md#upgrading-from-05x-schema-7--14).
+0.6.0 packages compile Team code but leave it off unless enabled; this L0 path
+stays on personal CLI/MCP. The optional Inspector is not bundled; run it from a
+source checkout.
 
 ## Bind the project
 
@@ -131,6 +148,33 @@ AWR_SESSION=$(jq -er '.resumed.session.id' "$AWR_NOTES/resume.json")
 ```
 
 Resume creates a new AWR session. It does not switch the host's native chat.
+
+## Inspect before retrying
+
+A CLI timeout, dropped MCP connection or expired claim does not prove the
+external command finished or failed. Query the original records before starting
+another session or repeating a side-effecting command:
+
+```sh
+awrj session show "$AWR_SESSION"
+awrj recovery inspect --session "$AWR_SESSION"
+awrj session compaction inspect --session "$AWR_SESSION"
+```
+
+If an execution id is already known, inspect that attempt rather than guessing:
+
+```sh
+awrj execution inspect "$AWR_EXECUTION"
+```
+
+These reads do not resume a session, record a compaction observation, defer a
+suggestion or kill a process. Missing occupancy or an unverified execution stays
+unknown; do not treat absence as zero or as failure. `session compaction inspect`
+does not take `--include-observation` here; that flag expands host telemetry and
+is not required to decide whether to continue.
+
+The optional [Inspector](../../../tools/inspector/README.md) surfaces the same
+read-only commands from a source checkout. It is not in the npm/PyPI packages.
 
 ## Compile context
 

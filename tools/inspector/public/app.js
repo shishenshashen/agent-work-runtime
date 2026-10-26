@@ -177,6 +177,25 @@
       event:             ['event'],
       payloadIncluded:   ['payload_included'],
     },
+    // awr session compaction inspect --json: occupancy, guidance; no observation body.
+    compaction: {
+      session:      ['session'],
+      state:        ['state'],
+      occupancy:    ['post_compaction_percent'],
+      delta:        ['previous_delta_percentage_points'],
+      observation:  ['observation_event_id'],
+      policy:       ['policy'],
+      guidance:     ['guidance'],
+      native:       ['native_compaction'],
+      switched:     ['session_switch_performed'],
+      readOnly:     ['read_only'],
+    },
+    guidance: {
+      when:         ['when'],
+      basis:        ['basis'],
+      nextAction:   ['next_action'],
+      recheck:      ['recheck'],
+    },
   };
 
   /** Read a dotted path, including array indices such as a.b.0.c. */
@@ -204,6 +223,12 @@
     return n;
   };
   const group = (n) => (n == null || isNaN(n) ? '—' : Math.round(n).toLocaleString(i18n.locale));
+
+  /** Host occupancy percent. Missing stays missing; never coerce to 0. */
+  function formatPercent(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+    return value.toFixed(1) + '%';
+  }
 
   /** Render a relative timestamp; preserve the original value if it cannot be parsed. */
   function since(value) {
@@ -260,6 +285,7 @@
     sessions: { items: [], loaded: false, error: null, command: null, mayHaveMore: false },
     selectedSession: null,
     sessionDetail: null,
+    compactionDetail: null,
     selectedRecovery: null,
     recoveryDetail: null,
     events: { items: [], loaded: false, error: null, command: null, mayHaveMore: false },
@@ -1266,6 +1292,39 @@
     };
   }
 
+  function applyCompactionInspect(id, response) {
+    const sid = id == null ? '' : String(id);
+    if (isUnsupported(response)) {
+      state.unsupported.add('session.compaction.inspect');
+      state.compactionDetail = {
+        id: sid,
+        loaded: true,
+        error: response.error,
+        data: null,
+        command: response.command,
+      };
+      return;
+    }
+    state.unsupported.delete('session.compaction.inspect');
+    if (response && response.ok) {
+      state.compactionDetail = {
+        id: sid,
+        loaded: true,
+        error: null,
+        data: response.data || {},
+        command: response.command,
+      };
+      return;
+    }
+    state.compactionDetail = {
+      id: sid,
+      loaded: true,
+      error: (response && response.error) || { code: 'Error', message: '' },
+      data: null,
+      command: response && response.command,
+    };
+  }
+
   async function selectSession(id) {
     const sid = id == null ? '' : String(id);
     if (!sid) return;
@@ -1273,27 +1332,40 @@
       sessionGuard.invalidate();
       state.selectedSession = null;
       state.sessionDetail = null;
+      state.compactionDetail = null;
       renderSessions();
       return;
     }
     const token = sessionGuard.begin(sid);
     state.selectedSession = sid;
     state.sessionDetail = { id: sid, loaded: false, error: null, data: null, command: null };
+    state.compactionDetail = { id: sid, loaded: false, error: null, data: null, command: null };
     renderSessions();
 
-    let response;
+    let sessionResponse;
+    let compactionResponse;
     if (state.mode === 'demo') {
-      const demo = window.AWR_DEMO && window.AWR_DEMO.sessionShows
-        ? window.AWR_DEMO.sessionShows[sid]
-        : null;
-      response = demo
-        ? { ok: true, data: demo, command: 'awr session show ' + sid }
+      const shows = window.AWR_DEMO && window.AWR_DEMO.sessionShows;
+      const inspects = window.AWR_DEMO && window.AWR_DEMO.compactionInspects;
+      const demoShow = shows ? shows[sid] : null;
+      const demoInspect = inspects ? inspects[sid] : null;
+      sessionResponse = demoShow
+        ? { ok: true, data: demoShow, command: 'awr session show ' + sid }
         : { ok: false, error: { code: 'NotFound', message: i18n.t('ui.session_show_missing') } };
+      compactionResponse = demoInspect
+        ? { ok: true, data: demoInspect, command: 'awr session compaction inspect --session ' + sid }
+        : { ok: false, error: { code: 'NotFound', message: i18n.t('ui.compaction_show_missing') } };
     } else {
-      response = await callApi('/api/session?id=' + encodeURIComponent(sid));
+      const [shown, inspected] = await Promise.all([
+        callApi('/api/session?id=' + encodeURIComponent(sid)),
+        callApi('/api/compaction?session=' + encodeURIComponent(sid)),
+      ]);
+      sessionResponse = shown;
+      compactionResponse = inspected;
     }
     if (!sessionGuard.isCurrent(token)) return;
-    applySessionShow(sid, response);
+    applySessionShow(sid, sessionResponse);
+    applyCompactionInspect(sid, compactionResponse);
     renderSessions();
   }
 
@@ -1309,10 +1381,12 @@
     const bag = state.sessionDetail;
     if (!bag || !bag.loaded) {
       host.appendChild(el('p', 'sub', i18n.t('ui.session_detail_loading')));
+      renderCompactionSection(host);
       return;
     }
     if (bag.error) {
       host.appendChild(errorBlock(bag.error, bag.command));
+      renderCompactionSection(host);
       return;
     }
     const data = bag.data || {};
@@ -1379,6 +1453,94 @@
       : null;
     if (incomplete != null) {
       host.appendChild(el('p', 'sub', i18n.t('ui.session_incomplete_saves', { p0: incomplete })));
+    }
+
+    renderCompactionSection(host);
+  }
+
+  function renderCompactionSection(host) {
+    const bag = state.compactionDetail;
+    if (!bag) return;
+    if (!bag.loaded) {
+      host.appendChild(el('p', 'sub', i18n.t('ui.compaction_detail_loading')));
+      return;
+    }
+    host.appendChild(el('h3', null, i18n.t('ui.compaction_inspect')));
+    if (bag.command) {
+      const cmd = el('div', 'cmd');
+      cmd.appendChild(el('span', 'prompt', '$'));
+      cmd.appendChild(el('code', null, bag.command));
+      host.appendChild(cmd);
+    }
+    if (bag.error) {
+      host.appendChild(errorBlock(bag.error, bag.command));
+      return;
+    }
+    const data = bag.data || {};
+    const C = FIELD_MAP.compaction;
+    const G = FIELD_MAP.guidance;
+    const guidance = pick(data, C.guidance, null) || {};
+    const occupancy = formatPercent(pick(data, C.occupancy, null));
+    const policy = pick(data, C.policy, null);
+    const threshold = policy && typeof policy.post_compaction_threshold_percent === 'number'
+      ? policy.post_compaction_threshold_percent
+      : null;
+
+    if (pick(data, C.readOnly, null) === true && pick(data, C.switched, null) === false) {
+      host.appendChild(el('p', 'sub', i18n.t('ui.compaction_read_only')));
+    }
+
+    const stateLine = el('p', null);
+    stateLine.appendChild(el('span', 'sub', i18n.t('ui.compaction_state') + ' '));
+    stateLine.appendChild(document.createTextNode(pick(data, C.state, '') || '—'));
+    host.appendChild(stateLine);
+
+    const occLine = el('p', null);
+    occLine.appendChild(el('span', 'sub', i18n.t('ui.compaction_occupancy') + ' '));
+    occLine.appendChild(document.createTextNode(occupancy || i18n.t('ui.compaction_occupancy_missing')));
+    host.appendChild(occLine);
+
+    if (threshold != null) {
+      const threshLine = el('p', null);
+      threshLine.appendChild(el('span', 'sub', i18n.t('ui.compaction_threshold') + ' '));
+      threshLine.appendChild(document.createTextNode(String(threshold) + '%'));
+      host.appendChild(threshLine);
+    }
+
+    const when = pick(guidance, G.when, null);
+    const basis = pick(guidance, G.basis, null);
+    const next = pick(guidance, G.nextAction, null);
+    const recheck = pick(guidance, G.recheck, null);
+    if (when) {
+      const line = el('p', null);
+      line.appendChild(el('span', 'sub', i18n.t('ui.compaction_guidance_when') + ' '));
+      line.appendChild(document.createTextNode(when));
+      host.appendChild(line);
+    }
+    if (basis) {
+      const line = el('p', null);
+      line.appendChild(el('span', 'sub', i18n.t('ui.compaction_guidance_basis') + ' '));
+      line.appendChild(document.createTextNode(basis));
+      host.appendChild(line);
+    }
+    if (next) {
+      const line = el('p', null);
+      line.appendChild(el('span', 'sub', i18n.t('ui.compaction_guidance_next') + ' '));
+      line.appendChild(document.createTextNode(next));
+      host.appendChild(line);
+    }
+    if (recheck) {
+      const line = el('p', null);
+      line.appendChild(el('span', 'sub', i18n.t('ui.compaction_guidance_recheck') + ' '));
+      line.appendChild(document.createTextNode(recheck));
+      host.appendChild(line);
+    }
+
+    if (pick(data, C.native, null) === 'unchanged') {
+      host.appendChild(el('p', 'sub', i18n.t('ui.compaction_native_unchanged')));
+    }
+    if (pick(data, C.switched, null) === false) {
+      host.appendChild(el('p', 'sub', i18n.t('ui.compaction_no_switch')));
     }
   }
 
@@ -2330,6 +2492,7 @@
     state.sessions = { items: [], loaded: false, error: null, command: null, mayHaveMore: false };
     state.selectedSession = null;
     state.sessionDetail = null;
+    state.compactionDetail = null;
     state.selectedRecovery = null;
     state.recoveryDetail = null;
     state.events = { items: [], loaded: false, error: null, command: null, mayHaveMore: false };
@@ -2853,7 +3016,7 @@
       teamWeb: () => teamWeb,
       createGenerationGuard, state, detailGuard, renderWorkDetail, normStatus, renderWork, loadWorkPage,
       renderPacketSize, doCompile, renderQueueList, fillWorkSelect, loadAll,
-      renderSessions, renderEvents, applyListResponse, applySessionShow, selectSession,
+      renderSessions, renderEvents, applyListResponse, applySessionShow, applyCompactionInspect, selectSession,
       renderPending, applyRecoveryInspect, selectRecovery,
       applyEventShow, selectEvent,
     };

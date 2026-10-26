@@ -268,6 +268,7 @@ const COMMANDS = {
   recoveryInspect: { argv: ['recovery', 'inspect'], write: false },
   eventHistory: { argv: ['event', 'history'], write: false },
   eventShow: { argv: ['event', 'show'], write: false },
+  compactionInspect: { argv: ['session', 'compaction', 'inspect'], write: false },
   // Project map: the official read-only commands behind the snapshot (see public/project-map/extract.js).
   mapWorkGraph: { argv: ['work', 'graph'], write: false },
   mapNav: { argv: ['nav', '--cached'], write: false },
@@ -699,6 +700,16 @@ const routes = {
     // --full is explicit payload expansion; cap bytes at the CLI default so the
     // Inspector cannot raise the limit through the query string.
     return runCommand('eventShow', [id, '--full', '--max-bytes', '65536']);
+  },
+
+  'GET /api/compaction': async (url) => {
+    const session = asKey(url.searchParams.get('session'));
+    if (!session) {
+      return { ok: false, error: { code: 'BadRequest', message: 'A valid session parameter is required' } };
+    }
+    // Read-only inspect only. Query strings cannot add --include-observation,
+    // observe or defer; those write runtime records or expand host telemetry.
+    return runCommand('compactionInspect', ['--session', session]);
   },
 
   // Project map data. Each route is one allowlisted read-only command with validated arguments.

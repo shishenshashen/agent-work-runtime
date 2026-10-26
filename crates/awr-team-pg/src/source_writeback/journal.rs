@@ -2,11 +2,17 @@
 use super::*;
 use request_binding::Intent;
 
+pub(super) const OPERATOR_DECISION_PROTOCOL: &str = "awr-operator-planning-writeback-v1";
+pub(super) const PENDING_PHASES: [&str; 3] = ["validated", "source_written", "pg_activating"];
+pub(super) const MAX_OPERATOR_REASON: usize = 500;
+
 pub(super) struct Journal {
     pub phase: String,
     pub intent: Intent,
     pub hash: String,
     pub receipt_id: Option<String>,
+    /// The schema owner closed this pending writeback without resuming it.
+    pub operator_closed: bool,
 }
 
 pub(super) async fn load(
@@ -17,21 +23,37 @@ pub(super) async fn load(
 ) -> PgResult<Option<Journal>> {
     let row = tx.query_opt(
         "SELECT phase,intent_hash,intent_json,audit_receipt_id,candidate_id,candidate_digest,publish_receipt_id,
-                before_fingerprint,after_fingerprint,affected_work_ids,dependency_work_ids
+                before_fingerprint,after_fingerprint,affected_work_ids,dependency_work_ids,body_json
          FROM awr_team.planning_writeback_journals WHERE tenant_id=$1 AND project_id=$2 AND request_id=$3 FOR UPDATE",
         &[&tenant,&project,&request],
     ).await?;
     let Some(row) = row else { return Ok(None) };
-    parse(&row, tenant, project, request).map(Some)
+    match parse(&row, tenant, project, request) {
+        Ok(journal) => Ok(Some(journal)),
+        Err(PgError::WritebackRefused(_) | PgError::SourceDivergence)
+            if operator_closed(
+                &row.get::<_, Value>(11),
+                &row.get::<_, String>(0),
+                request,
+                row.get::<_, Option<String>>(1).as_deref(),
+            ) =>
+        {
+            Err(operator_closed_error())
+        }
+        Err(error) => Err(error),
+    }
 }
 
-fn parse(
+/// Columns 0..=10 are the journal facts in `load` order; column 11 is `body_json`.
+pub(super) fn parse(
     row: &tokio_postgres::Row,
     tenant: &str,
     project: &str,
     request: &str,
 ) -> PgResult<Journal> {
     let hash: String = row.get::<_, Option<String>>(1).ok_or_else(unknown)?;
+    let phase: String = row.get(0);
+    let body: Value = row.get(11);
     let intent: Intent =
         serde_json::from_value(row.get::<_, Option<Value>>(2).ok_or_else(unknown)?)
             .map_err(|_| unknown())?;
@@ -51,11 +73,103 @@ fn parse(
         return Err(PgError::SourceDivergence);
     };
     Ok(Journal {
-        phase: row.get(0),
+        phase: phase.clone(),
         intent,
-        hash,
+        hash: hash.clone(),
         receipt_id: row.get(3),
+        operator_closed: operator_closed(&body, &phase, request, Some(&hash)),
     })
+}
+
+/// A recorded decision object, including a malformed or phase-inconsistent one.
+pub(super) fn recorded_operator_decision(body: &Value) -> Option<&Value> {
+    body.get("operator_decision").filter(|d| d.is_object())
+}
+
+fn identity(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 200 && !value.chars().any(char::is_control)
+}
+
+fn hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn source_fingerprint(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(hex)
+}
+
+/// Whether a retained decision proves that the schema owner closed this exact journal.
+/// All readers and the operator replay path use this same structural classification.
+pub(super) fn valid_operator_decision(
+    decision: &Value,
+    phase: &str,
+    request: &str,
+    recorded_hash: Option<&str>,
+) -> bool {
+    if phase != "refused" {
+        return false;
+    }
+    let Some(source_state) = decision.get("source_state").and_then(Value::as_str) else {
+        return false;
+    };
+    let source_shape = match source_state {
+        "at_before" | "at_after" | "drifted" => decision
+            .get("source_fingerprint")
+            .and_then(Value::as_str)
+            .is_some_and(source_fingerprint),
+        "unreadable" | "unknown" => decision
+            .get("source_fingerprint")
+            .is_some_and(Value::is_null),
+        _ => false,
+    };
+    decision.get("protocol").and_then(Value::as_str) == Some(OPERATOR_DECISION_PROTOCOL)
+        && decision.get("action").and_then(Value::as_str) == Some("abandon")
+        && decision.get("request_id").and_then(Value::as_str) == Some(request)
+        && decision
+            .get("previous_phase")
+            .and_then(Value::as_str)
+            .is_some_and(|previous| PENDING_PHASES.contains(&previous))
+        && decision
+            .get("intent_hash")
+            .is_some_and(|hash| match (hash.as_str(), recorded_hash) {
+                (Some(decision_hash), Some(saved_hash)) => {
+                    hex(decision_hash) && decision_hash == saved_hash
+                }
+                (None, None) => hash.is_null(),
+                _ => false,
+            })
+        && source_shape
+        && decision.get("source_retained").and_then(Value::as_bool)
+            == Some(source_state != "at_before")
+        && decision
+            .get("operator_role")
+            .and_then(Value::as_str)
+            .is_some_and(identity)
+        && decision
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| {
+                !reason.trim().is_empty()
+                    && reason.chars().count() <= MAX_OPERATOR_REASON
+                    && !reason.chars().any(char::is_control)
+            })
+        && decision
+            .get("project_revision")
+            .and_then(Value::as_str)
+            .and_then(|revision| revision.parse::<i64>().ok())
+            .is_some_and(|revision| revision >= 0)
+}
+
+fn operator_closed(body: &Value, phase: &str, request: &str, recorded_hash: Option<&str>) -> bool {
+    recorded_operator_decision(body)
+        .is_some_and(|decision| valid_operator_decision(decision, phase, request, recorded_hash))
+}
+
+pub(super) fn operator_closed_error() -> PgError {
+    PgError::WritebackRefused("the schema owner closed this pending writeback without activating it; inspect the source and use a new reviewed request".into())
 }
 
 fn unknown() -> PgError {
@@ -118,7 +232,7 @@ pub(crate) async fn outcome_in_tx(
 ) -> PgResult<Option<Value>> {
     let row = tx.query_opt(
         "SELECT phase,intent_hash,intent_json,audit_receipt_id,candidate_id,candidate_digest,publish_receipt_id,
-                before_fingerprint,after_fingerprint,affected_work_ids,dependency_work_ids
+                before_fingerprint,after_fingerprint,affected_work_ids,dependency_work_ids,body_json
          FROM awr_team.planning_writeback_journals
          WHERE tenant_id=$1 AND project_id=$2 AND request_id=$3 FOR SHARE", &[&tenant,&project,&request],
     ).await?;
@@ -161,14 +275,24 @@ pub(crate) async fn outcome_in_tx(
     } else {
         false
     };
-    Ok(Some(
-        json!({"request_id":request,"phase":phase,"original_intent_bound":bound,
+    // The schema owner closed a pending journal without resuming it. Nothing was activated.
+    let closed = operator_closed(
+        &row.get::<_, Value>(11),
+        &phase,
+        request,
+        row.get::<_, Option<String>>(1).as_deref(),
+    );
+    let mut outcome = json!({"request_id":request,"phase":phase,"original_intent_bound":bound,
         "pending":matches!(phase.as_str(),"validated"|"source_written"|"pg_activating"),
         "source_writeback_pending":!applied,"applied":applied,
         "activation_receipt_id":if applied {row.get::<_,Option<String>>(3)} else {None},
-        "next_step":if !bound {"original intent is unknown or inconsistent; inspect retained facts without inferring authority"}
+        "next_step":if closed {"the schema owner closed this writeback without activating it; inspect the source and submit a new reviewed request"}
+            else if !bound {"original intent is unknown or inconsistent; inspect retained facts without inferring authority"}
             else if phase=="completed" && !applied {"activation confirmation is inconsistent; inspect retained source and receipts before recovery"}
             else if applied {"reuse the original receipt; do not activate again"}
-            else {"inspect the source and resume the same original request; pending is not applied"}}),
-    ))
+            else {"inspect the source and resume the same original request; pending is not applied"}});
+    if closed {
+        outcome["operator_closed"] = json!(true);
+    }
+    Ok(Some(outcome))
 }

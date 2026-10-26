@@ -330,6 +330,23 @@ claims, open waits or nonterminal/unknown execution on the work, and never treat
 an ended session as proof that an external effect stopped. Execution admission,
 claim transfer and resource release are not performed by these commands.
 
+A native client exit or MCP disconnect is separate from logical session closure.
+Ongoing work may save a checkpoint and retain its valid claim. When the caller
+intentionally ends the logical session, it first reports and settles execution
+effects and resolves any open wait. If this session holds an active claim, it
+releases that claim with the current session, claim, fence and lease versions.
+It then submits `session.end` with the current session version. This sequence
+does not complete the work, approve a review, integrate a delivery or prove that
+an external process stopped.
+
+A known synchronous `session.end` refusal keeps HTTP 409 and the public
+`RecoveryBlocked` code, and adds a bounded `rejection` object with
+`operation: "session.end"`, `outcome: "known_rejection"`, one finite `reason`,
+and `action_guidance` containing `when`, `because`, `action` and `recheck_on`.
+Reasons are `UNRESOLVED_EFFECTS`, `WAIT_OPEN` and `ACTIVE_CLAIM`, in that
+precedence when more than one condition applies. Guidance exposes no row counts,
+peer identities or object values, performs no release, and grants no authority.
+
 On timeout or an unconsumed response, query `command.inspect` with the original
 `request_id` and work. It returns only this authenticated actor/client's receipt
 under the current workstream and ownership boundary. A found receipt preserves
@@ -339,6 +356,9 @@ payload**: replay returns the original receipt without duplicating a session,
 checkpoint or event; changing the payload returns `IdempotencyConflict`. Current
 authorization and epoch/ownership still apply to replay. Already committed
 receipts remain queryable during a freeze; replay performs no new mutation.
+A returned `known_rejection` is not a missing or uncertain transport outcome:
+follow its guidance and do not use `command.inspect` or repeat the unchanged
+request merely because rejected commands have no committed operation receipt.
 
 ## Coordination claims
 
@@ -498,6 +518,16 @@ resource identity is a later protocol.
 Only the original actor/client with current write authority may report. An elapsed
 claim does not prevent recording an observation; current session, ownership and
 epoch binding still apply. Reports may be recorded while the workstream is paused.
+
+`observed_paths` includes every actual workspace effect, including baseline
+imports; contribution paths relative to an imported target cannot replace it.
+An optional closed `baseline_transition` records caller-asserted Git revisions,
+operation and contribution paths for provenance only. It never changes the
+scope check or releases resources. The full statement stays in the original
+caller receipt; ordinary acknowledgements and verification expose only a compact
+`baseline_transition_provenance` descriptor. Legacy fields remain absent when no
+transition was supplied. See [actual effects and bounded baseline updates](team-execution-settlement.md#actual-effects-and-contribution-provenance)
+for the exact input and separately reviewed baseline-task workflow.
 
 These are **caller assertions**, not trusted result or stop confirmations. Each
 report is kept verbatim in an attributed execution receipt, including observations

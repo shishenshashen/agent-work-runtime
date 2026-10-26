@@ -366,8 +366,10 @@ pub(crate) async fn dispatch_authorized(
     match result {
         Ok(Ok(value)) => response(StatusCode::OK, value),
         Ok(Err(error)) => {
-            let rejection = claim_rejection(&action, &error);
-            let (status, mut value) = public_error(legacy_claim_acquire_error(&action, error));
+            let rejection =
+                claim_rejection(&action, &error).or_else(|| session_end_rejection(&action, &error));
+            let error = legacy_claim_acquire_error(&action, error);
+            let (status, mut value) = public_error(legacy_session_end_error(&action, error));
             if let Some(rejection) = rejection {
                 value["rejection"] = rejection;
             }
@@ -1191,6 +1193,21 @@ fn legacy_claim_acquire_error(action: &str, error: PgError) -> PgError {
     }
 }
 
+/// Keep the published `session.end` rejection envelope stable.
+///
+/// The command layer uses existing finite errors to retain the first safe next
+/// action. Callers still receive the original `RecoveryBlocked` code and status;
+/// the bounded `rejection` object carries the finer diagnosis.
+fn legacy_session_end_error(action: &str, error: PgError) -> PgError {
+    if action != "session.end" {
+        return error;
+    }
+    match error {
+        PgError::ClaimHeld | PgError::WaitOpen => PgError::RecoveryBlocked,
+        other => other,
+    }
+}
+
 /// Name the existing rejection of `claim.acquire` in machine-readable form.
 ///
 /// The coordinator has already decided; this only labels that decision for the
@@ -1233,6 +1250,52 @@ pub(crate) fn claim_rejection(action: &str, error: &PgError) -> Option<Value> {
         "authority": "coordinator",
         "next_action": next_action,
         "recheck": "After inspection or refresh. The rejection mutated nothing; the coordinator remains the only claim authority."
+    }))
+}
+
+/// Explain a known synchronous `session.end` rejection without exposing rows.
+///
+/// The command transaction has already rolled back. These fixed strings name
+/// only the blocker class and safe lifecycle order; they contain no claim,
+/// execution, wait, actor or peer identifiers and grant no new authority.
+pub(crate) fn session_end_rejection(action: &str, error: &PgError) -> Option<Value> {
+    if action != "session.end" {
+        return None;
+    }
+    let (reason, when, because, next_action, recheck) = match error {
+        PgError::RecoveryBlocked => (
+            "UNRESOLVED_EFFECTS",
+            "Logical session.end was rejected while an existing close guard and unresolved work effects or recovery coincide.",
+            "Nonterminal execution blocks closure; unresolved recovery or reservations take priority over wait or release guidance.",
+            "Inspect current execution and recovery state with work.observe.",
+            "After inspection, follow only the currently authorized execution.report or operator execution.reconcile path indicated by current facts; once effects are resolved, refresh versions and decide whether an active claim needs claim.release before a new session.end.",
+        ),
+        PgError::WaitOpen => (
+            "WAIT_OPEN",
+            "Logical session.end was rejected while this session has an open wait.",
+            "The wait must be resolved before claim release and logical session closure.",
+            "Resolve the open wait through its existing authorized workflow.",
+            "After confirmed wait resolution, refresh current facts and assess all remaining close obligations, including any active claim; submit a new session.end only when no close blocker remains and closure is still intended.",
+        ),
+        PgError::ClaimHeld => (
+            "ACTIVE_CLAIM",
+            "Logical session.end was rejected while this session owns an active, release-ready claim.",
+            "session.end does not release ownership or bypass claim fence and lease checks.",
+            "Call claim.release with the current session, claim, fence and lease versions.",
+            "After claim.release succeeds, refresh current facts and confirm no close blocker remains; submit a new session.end only if closure is still intended. Session closure does not complete, approve or integrate work.",
+        ),
+        _ => return None,
+    };
+    Some(json!({
+        "reason": reason,
+        "operation": "session.end",
+        "outcome": "known_rejection",
+        "action_guidance": {
+            "when": when,
+            "because": because,
+            "action": next_action,
+            "recheck_on": recheck
+        }
     }))
 }
 

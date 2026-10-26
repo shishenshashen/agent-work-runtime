@@ -206,6 +206,27 @@ if (mode === 'slow') {
     side_effects_performed: false,
     next_step: 'Use doctor for read-only current-source and artifact diagnostics, then session resume.',
   });
+} else if (joined.includes('session compaction inspect')) {
+  emit({
+    ok: true,
+    version: 1,
+    read_only: true,
+    project_revision: 7,
+    session: 11,
+    state: 'continue',
+    observation_event_id: 31,
+    post_compaction_percent: 42.0,
+    previous_delta_percentage_points: null,
+    policy: { post_compaction_threshold_percent: 50 },
+    guidance: {
+      when: 'Same model/window; completed automatic compaction is below threshold',
+      basis: 'Host-reported post-compaction occupancy 42.0%; threshold 50% (heuristic)',
+      next_action: 'Continue the current task with native compaction enabled',
+      recheck: 'Next completed compaction or changed model/window',
+    },
+    native_compaction: 'unchanged',
+    session_switch_performed: false,
+  });
 } else if (joined.includes('session show')) {
   emit({
     ok: true,

@@ -40,7 +40,9 @@ pub(super) async fn facts(
         "recovery":{"unsettled_execution":barriers.get::<_,bool>(0),"unknown_resource":barriers.get::<_,bool>(1),
             "expired_claim":barriers.get::<_,bool>(2),"claim_binding_changed":barriers.get::<_,bool>(4)},"claim_present":barriers.get::<_,bool>(3),
         "facts_truncated":false,"integration":null,"publication":null,
-        "acceptance_inferred":false,"source_synchronized":false});
+        "acceptance_inferred":false,"source_synchronized":null,
+        "source_state":{"observation":"not_measured","basis":"current_physical_source",
+            "query":{"protocol_version":1,"op":"delivery.source.status","work_id":work}}});
     let round = tx
         .query_opt(
             "SELECT r.id,r.state,r.bundle_hash,r.author_actor_id,e.payload_json->>'delivery_candidate_digest'
@@ -140,6 +142,53 @@ pub(super) async fn facts(
         crate::DeliverySyncStore::integration_summary_in_tx(tx, tenant, project, auth, work, None)
             .await?;
     Ok(data)
+}
+
+/// Measure once for a detailed work read. Shallow inbox items retain an
+/// explicit unknown and a query, avoiding a source scan per list item.
+pub(super) async fn observe_source(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    project: &str,
+    auth: &ReaderAuthority,
+    work: &str,
+    data: &mut Value,
+) -> PgResult<()> {
+    if data["delivery_required"] != true && data["publication"].is_null() {
+        return Ok(());
+    }
+    match crate::DeliverySyncStore::source_publication_observation_in_tx(
+        tx, tenant, project, auth, work,
+    )
+    .await
+    {
+        Ok(status) => {
+            let measured = status["source_observation"] == "observed";
+            let synchronized = if measured
+                && (status["history_truncated"] != true || status["source_synchronized"] == true)
+            {
+                status["source_synchronized"].clone()
+            } else {
+                Value::Null
+            };
+            data["source_synchronized"] = synchronized.clone();
+            data["source_state"] = json!({"observation":status["source_observation"],
+                "basis":"current_physical_source","source_synchronized":synchronized,
+                "metadata_revision":status["metadata_revision"],"source_fingerprint":status["source_fingerprint"],
+                "projection_current":if measured {status["projection_current"].clone()}else{Value::Null},
+                "cursor_current":if measured {status["cursor_current"].clone()}else{Value::Null},
+                "pending_publication_id":status["pending_publication_id"],"history_truncated":status["history_truncated"],
+                "query":{"protocol_version":1,"op":"delivery.source.status","work_id":work}});
+        }
+        Err(PgError::Unsupported(_)) => {
+            data["source_state"]["observation"] = json!("unsupported_source")
+        }
+        Err(PgError::SourceDivergence) => {
+            data["source_state"]["observation"] = json!("source_binding_unavailable")
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(())
 }
 
 pub(super) fn permits(
@@ -310,8 +359,8 @@ fn select(
         && c["delivery_required"] == true
         && c["candidate"].is_null()
         && c["review"].is_null()
-        && data["execution"]["state"] == "succeeded"
-        && data["execution"]["effects_settled"] == true
+        && super::guidance::session_execution(data)["state"] == "succeeded"
+        && super::guidance::session_execution(data)["effects_settled"] == true
     {
         (
             "submission",
@@ -476,10 +525,15 @@ pub(super) async fn read(
         let ready = observed["dependencies_ready_advisory"] == true;
         let hint = condition(auth, &observed, stream_id, &work, ready);
         if let Some(hint) = hint {
+            let mut collaboration = observed["collaboration"].clone();
+            // Query timing describes this read, not a change in the underlying facts.
+            if let Some(source_state) = collaboration["source_state"].as_object_mut() {
+                source_state.remove("query_started_at_unix_ms");
+            }
             let semantic = json!({"work":work,"contract":observed["contract_hash"],"code":hint["code"],
                 "responsibility":observed["responsibility"]["version"],"runtime":observed["runtime"],
                 "progress":{"phase":observed["progress"]["phase"],"blockers":observed["progress"]["blockers"]},
-                "waiting_user":observed["waiting_user"],"collaboration":observed["collaboration"],"dependencies_ready":ready});
+                "waiting_user":observed["waiting_user"],"collaboration":collaboration,"dependencies_ready":ready});
             items.push(json!({"item_key":hash(&semantic)?,"work_id":work,"workstream_id":stream,
                 "contract_hash":observed["contract_hash"],"title":row.get::<_,String>(1).chars().take(160).collect::<String>(),
                 "title_truncated":row.get::<_,String>(1).chars().count()>160,

@@ -20,6 +20,205 @@ use std::time::Duration;
 type Client = RunningService<RoleClient, ()>;
 
 #[tokio::test]
+async fn artifact_segments_reconstruct_exact_bytes_with_bounded_mcp_envelopes() {
+    use base64::Engine;
+    use sha2::Digest;
+    let (_guard, admin, _, store) = setup().await;
+    enable_writes(&admin).await;
+    let server = start(store).await;
+    let client = connect(&server, "one", A).await.unwrap();
+    let text = "line: \"雪🌱\" \\ tab\t\r\n".repeat(1200);
+    let binary: Vec<u8> = (0..19001).map(|i| (i % 256) as u8).collect();
+    for (case, bytes, budget) in [
+        ("unicode", text.into_bytes(), 4096),
+        ("binary", binary, 2047),
+        ("empty", vec![], 1),
+    ] {
+        let args = json!({"session_id":"session-a","expected_session_version":"1",
+            "payload":{"passed":true},"artifact_hex":bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "dirty_tree":false});
+        let submitted = call(
+            &client,
+            "awr_team_command",
+            serde_json::to_value(command(
+                &prepared(&client).await,
+                &format!("segments-{case}"),
+                "evidence.submit",
+                args,
+            ))
+            .unwrap(),
+            false,
+        )
+        .await;
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        assert_eq!(submitted["receipt"]["data"]["artifact_digest"], digest);
+        let initial = json!({"protocol_version":1,"op":"artifact.segment","work_id":"a",
+            "artifact_id":submitted["receipt"]["data"]["artifact_id"],"expected_sha256":digest,"max_context_bytes":budget});
+        let mut query = initial.clone();
+        let mut combined = Vec::new();
+        let mut pages = 0;
+        loop {
+            let response = client
+                .call_tool(
+                    CallToolRequestParams::new("awr_team_query")
+                        .with_arguments(query.as_object().unwrap().clone()),
+                )
+                .await
+                .unwrap();
+            assert!(!response.is_error.unwrap_or(false), "{response:?}");
+            assert!(
+                serde_json::to_vec(&response).unwrap().len()
+                    <= awr_team_pg::WorkstreamQuery::MAX_ARTIFACT_SEGMENT_WIRE_BYTES
+            );
+            let value = response.structured_content.as_ref().unwrap();
+            let data = &value["data"];
+            assert_eq!(data["range"]["start"], combined.len());
+            let part = base64::engine::general_purpose::STANDARD
+                .decode(data["content_base64"].as_str().unwrap())
+                .unwrap();
+            assert!(part.len() <= budget);
+            assert_eq!(
+                data["segment_sha256"],
+                format!("{:x}", sha2::Sha256::digest(&part))
+            );
+            combined.extend(part);
+            assert_eq!(data["range"]["end_exclusive"], combined.len());
+            assert_eq!(data["byte_length"], bytes.len());
+            assert_eq!(data["sha256"], digest);
+            assert_eq!(data["execution_authorized"], false);
+            pages += 1;
+            assert!(pages < 50);
+            if data["end_of_artifact"] == true {
+                assert!(data["next_query"].is_null());
+                assert!(data["next_cursor"].is_null());
+                break;
+            }
+            assert!(data["next_cursor"].is_string());
+            query = data["next_query"].clone();
+        }
+        assert_eq!(combined, bytes);
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(&combined)), digest);
+        assert_eq!(pages == 1, bytes.is_empty());
+        // The old full read still returns the entire object, never a prefix.
+        let mut full = initial.clone();
+        full["op"] = json!("artifact.content");
+        full.as_object_mut().unwrap().remove("max_context_bytes");
+        let old = call(&client, "awr_team_query", full, false).await;
+        if let Ok(text) = String::from_utf8(bytes.clone()) {
+            assert_eq!(old["data"]["text"], text);
+        } else {
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(old["data"]["content_base64"].as_str().unwrap())
+                    .unwrap(),
+                bytes
+            );
+        }
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn artifact_segments_reauthorize_each_page_and_reject_stale_or_invalid_ranges() {
+    let (_guard, admin, _, store) = setup().await;
+    enable_writes(&admin).await;
+    let server = start(store).await;
+    let client = connect(&server, "one", A).await.unwrap();
+    let submitted = call(
+        &client,
+        "awr_team_command",
+        serde_json::to_value(command(
+            &prepared(&client).await,
+            "segment-boundary-evidence",
+            "evidence.submit",
+            json!({"session_id":"session-a","expected_session_version":"1",
+            "payload":{"passed":true},"artifact_text":"abcdefghi","dirty_tree":false}),
+        ))
+        .unwrap(),
+        false,
+    )
+    .await;
+    let initial = json!({"protocol_version":1,"op":"artifact.segment","work_id":"a",
+        "artifact_id":submitted["receipt"]["data"]["artifact_id"],"expected_sha256":submitted["receipt"]["data"]["artifact_digest"],"max_context_bytes":3});
+    let first = call(&client, "awr_team_query", initial.clone(), false).await;
+    let next = first["data"]["next_query"].clone();
+    let second = call(&client, "awr_team_query", next.clone(), false).await;
+    assert_eq!(second["data"]["range"]["start"], 3);
+    assert_eq!(
+        second["data"],
+        call(&client, "awr_team_query", next.clone(), false).await["data"]
+    );
+    let mut smaller_page = next.clone();
+    smaller_page["max_context_bytes"] = json!(2);
+    let smaller = call(&client, "awr_team_query", smaller_page, false).await;
+    assert_eq!(
+        smaller["data"]["range"],
+        json!({"start":3,"end_exclusive":5})
+    );
+    assert_eq!(smaller["data"]["next_query"]["max_context_bytes"], 2);
+    for (field, value) in [
+        ("cursor", json!("bad")),
+        ("expected_sha256", json!("f".repeat(64))),
+        ("work_id", json!("b-private")),
+        ("artifact_id", json!("missing")),
+        ("max_context_bytes", json!(4097)),
+    ] {
+        let mut bad = next.clone();
+        bad[field] = value;
+        call(&client, "awr_team_query", bad, true).await;
+    }
+    for offset in [2_u64, 4, 9, u64::MAX] {
+        let mut bad = next.clone();
+        let mut cursor: Value = serde_json::from_str(bad["cursor"].as_str().unwrap()).unwrap();
+        cursor["offset"] = json!(offset);
+        bad["cursor"] = json!(cursor.to_string());
+        call(&client, "awr_team_query", bad, true).await;
+    }
+    let artifact_id = submitted["receipt"]["data"]["artifact_id"]
+        .as_str()
+        .unwrap();
+    admin
+        .execute(
+            "UPDATE awr_team.artifacts SET byte_length=byte_length+1 WHERE id=$1",
+            &[&artifact_id],
+        )
+        .await
+        .unwrap();
+    call(&client, "awr_team_query", initial.clone(), true).await;
+    admin
+        .execute(
+            "UPDATE awr_team.artifacts SET byte_length=byte_length-1 WHERE id=$1",
+            &[&artifact_id],
+        )
+        .await
+        .unwrap();
+    admin.batch_execute("UPDATE awr_team.workstream_ownership SET ownership_version=ownership_version+1 WHERE work_id='a';
+        UPDATE awr_team.workstream_snapshot_ownership SET ownership_version=ownership_version+1 WHERE work_id='a'").await.unwrap();
+    call(&client, "awr_team_query", next.clone(), true).await;
+    call(&client, "awr_team_query", initial.clone(), false).await;
+    let mut no_digest = initial.clone();
+    no_digest.as_object_mut().unwrap().remove("expected_sha256");
+    let refused = call(&client, "awr_team_query", no_digest, true).await;
+    assert_eq!(refused["invalid_field"], "/expected_sha256");
+    admin.batch_execute("UPDATE awr_team.workstream_grants SET grant_version=grant_version+1 WHERE client_id='cli-a'").await.unwrap();
+    call(&client, "awr_team_query", next.clone(), true).await;
+    let fresh = call(&client, "awr_team_query", initial.clone(), false).await;
+    admin.batch_execute("UPDATE awr_team.workstream_grants SET can_read=false,can_write=false,grant_version=grant_version+1 WHERE client_id='cli-a'").await.unwrap();
+    let revoked = client
+        .call_tool(
+            CallToolRequestParams::new("awr_team_query")
+                .with_arguments(fresh["data"]["next_query"].as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        revoked.to_string().contains("HTTP 403 Forbidden"),
+        "{revoked}"
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn shared_role_guidance_has_http_mcp_reconnect_and_revocation_parity() {
     let (_guard, admin, _db, store) = setup().await;
     enable_writes(&admin).await;
@@ -176,6 +375,41 @@ async fn prepared(client: &Client) -> Value {
         false,
     )
     .await
+}
+
+fn assert_session_end_rejection(
+    response: &Value,
+    reason: &str,
+    action_fragment: &str,
+    private_values: &[&str],
+) {
+    assert_eq!(response["code"], "RecoveryBlocked");
+    assert_eq!(response["message"], "recovery blocked");
+    assert_eq!(response["rejection"]["reason"], reason);
+    assert_eq!(response["rejection"]["operation"], "session.end");
+    assert_eq!(response["rejection"]["outcome"], "known_rejection");
+    assert_eq!(response["rejection"].as_object().unwrap().len(), 4);
+    assert_eq!(
+        response["rejection"]["action_guidance"]
+            .as_object()
+            .unwrap()
+            .len(),
+        4
+    );
+    for field in ["when", "because", "action", "recheck_on"] {
+        assert!(response["rejection"]["action_guidance"][field].is_string());
+    }
+    assert!(
+        response["rejection"]["action_guidance"]["action"]
+            .as_str()
+            .unwrap()
+            .contains(action_fragment)
+    );
+    assert!(serde_json::to_vec(response).unwrap().len() < 1024);
+    assert!(!response.to_string().contains("command.inspect"));
+    for private in private_values {
+        assert!(!response.to_string().contains(private));
+    }
 }
 fn rpc(method: &str, params: Value) -> Value {
     json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})
@@ -1652,6 +1886,205 @@ async fn previous_epoch_recovery_requires_explicit_review_over_http_and_replays_
     recovery_over_transports(true, "reference_write_v1", true).await;
 }
 
+#[tokio::test]
+async fn baseline_transition_discovery_and_report_are_concise_and_transport_stable() {
+    let (_guard, admin, _, store) = setup().await;
+    enable_writes(&admin).await;
+    let mut contract: awr_team::WorkContract = serde_json::from_value(
+        admin
+            .query_one(
+                "SELECT contract_json FROM awr_team.work_contracts WHERE work_id='a'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0),
+    )
+    .unwrap();
+    contract.codec = awr_team::WorkContract::CODEC_V3.into();
+    contract.completion_policy = awr_team::ExecutionSettlementPolicy::COMPLETION_POLICY.into();
+    contract.execution_settlement = Some(awr_team::ExecutionSettlementPolicy {
+        mode: awr_team::ExecutionSettlementMode::IndependentWorkspaceV1,
+        workspace_id: "mcp-workspace".into(),
+    });
+    admin
+        .execute(
+            "UPDATE awr_team.work_contracts SET contract_json=$1,contract_hash=$2 WHERE work_id='a'",
+            &[&json!(contract), &contract.hash().unwrap()],
+        )
+        .await
+        .unwrap();
+    let server = start(store).await;
+    let client = connect(&server, "one", A).await.unwrap();
+    let tools = client.list_all_tools().await.unwrap();
+    let command_schema = &tools
+        .iter()
+        .find(|tool| tool.name == "awr_team_command")
+        .unwrap()
+        .input_schema;
+    let fields = &command_schema["properties"]["args"]["properties"];
+    let transition_schema = &fields["baseline_transition"];
+    assert_eq!(transition_schema["additionalProperties"], false);
+    assert_eq!(
+        transition_schema["required"],
+        json!([
+            "kind",
+            "operation",
+            "workspace_before_revision",
+            "imported_revision",
+            "workspace_after_revision",
+            "contribution_paths"
+        ])
+    );
+    assert_eq!(
+        transition_schema["properties"]["operation"]["enum"],
+        json!(["fast_forward_only", "merge_no_ff"])
+    );
+    assert_eq!(
+        transition_schema["properties"]["contribution_paths"]["maxItems"],
+        128
+    );
+    assert_eq!(
+        transition_schema["properties"]["contribution_paths"]["uniqueItems"],
+        true
+    );
+    assert!(fields.get("baseline_transition_provenance").is_none());
+    assert!(
+        fields["observed_paths"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("all actual workspace effects")
+    );
+    let transition_description = transition_schema["description"].as_str().unwrap();
+    assert!(transition_description.contains("caller-asserted Git attribution"));
+    assert!(transition_description.contains("never scope"));
+    assert!(
+        transition_schema["properties"]["contribution_paths"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Provenance only")
+    );
+    let claim = call(
+        &client,
+        "awr_team_command",
+        serde_json::to_value(command(
+            &prepared(&client).await,
+            "transition-claim",
+            "claim.acquire",
+            json!({"session_id":"session-a","expected_session_version":"1",
+                "expected_work_version":"0","ttl_seconds":60}),
+        ))
+        .unwrap(),
+        false,
+    )
+    .await;
+    let claim = &claim["receipt"]["data"];
+    let prepared_execution = prepared(&client).await;
+    let execution = call(
+        &client,
+        "awr_team_command",
+        serde_json::to_value(command(
+            &prepared_execution,
+            "transition-prepare",
+            "execution.prepare",
+            json!({"session_id":"session-a","expected_session_version":"1",
+                "claim_id":claim["claim_id"],"expected_fence":claim["fence"],
+                "expected_lease_version":claim["lease_version"],
+                "expected_work_version":prepared_execution["data"]["runtime"]["work_version"],
+                "input_digest":"a".repeat(64),"declared_scope":["src"]}),
+        ))
+        .unwrap(),
+        false,
+    )
+    .await;
+    let execution = &execution["receipt"]["data"];
+    let prepared_start = prepared(&client).await;
+    let started = call(
+        &client,
+        "awr_team_command",
+        serde_json::to_value(command(
+            &prepared_start,
+            "transition-start",
+            "execution.start",
+            json!({"session_id":"session-a","expected_session_version":"1",
+                "execution_id":execution["execution_id"],
+                "expected_execution_version":execution["execution_version"],
+                "claim_id":claim["claim_id"],"expected_fence":claim["fence"],
+                "expected_lease_version":claim["lease_version"],
+                "expected_work_version":prepared_start["data"]["runtime"]["work_version"],
+                "execution_mode":"caller_managed"}),
+        ))
+        .unwrap(),
+        false,
+    )
+    .await;
+    let transition = json!({
+        "kind":"caller_asserted_git_baseline_v1",
+        "operation":"fast_forward_only",
+        "workspace_before_revision":{
+            "resource":"local-repository:mcp-regression","format":"git_sha1","value":"1".repeat(40)},
+        "imported_revision":{
+            "resource":"local-repository:mcp-regression","format":"git_sha1","value":"2".repeat(40)},
+        "workspace_after_revision":{
+            "resource":"local-repository:mcp-regression","format":"git_sha1","value":"2".repeat(40)},
+        "contribution_paths":[]
+    });
+    let report = serde_json::to_value(command(
+        &prepared(&client).await,
+        "transition-report",
+        "execution.report",
+        json!({"session_id":"session-a","expected_session_version":"1",
+            "execution_id":execution["execution_id"],
+            "expected_execution_version":started["receipt"]["data"]["execution_version"],
+            "outcome":"succeeded","output_digest":"b".repeat(64),
+            "observed_paths":["src/imported.rs"],"note":"Reported the actual transition.",
+            "workspace_settlement":{"workspace_id":"mcp-workspace","input_digest":"a".repeat(64),
+                "environment_digest":"c".repeat(64),"claim_id":claim["claim_id"],
+                "expected_fence":claim["fence"],"expected_lease_version":claim["lease_version"],
+                "executor_stopped":true,"no_external_effects":true},
+            "baseline_transition":transition.clone()}),
+    ))
+    .unwrap();
+    let reported = call(&client, "awr_team_command", report.clone(), false).await;
+    let data = &reported["receipt"]["data"];
+    assert_eq!(data["state"], "succeeded");
+    assert_eq!(
+        data["baseline_transition_provenance"],
+        json!({"origin":"caller_asserted","purpose":"provenance_only"})
+    );
+    assert!(data.get("baseline_transition").is_none());
+    let payload: Value = admin
+        .query_one(
+            "SELECT payload_json FROM awr_team.execution_receipts WHERE id=$1",
+            &[&data["receipt_id"].as_str().unwrap()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(payload["baseline_transition"], transition);
+    let replay: Value = http()
+        .post(format!("{}/one/command", server.url))
+        .bearer_auth(A)
+        .json(&report)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replay["receipt"], reported["receipt"]);
+    assert_eq!(replay["replayed"], true);
+    let mut changed = report;
+    changed["args"]["baseline_transition"]["contribution_paths"] = json!(["src/relabelled.rs"]);
+    assert_eq!(
+        call(&client, "awr_team_command", changed, true).await["code"],
+        "IdempotencyConflict"
+    );
+    client.cancel().await.unwrap();
+}
+
 async fn recovery_over_transports(trusted: bool, mode: &str, previous_epoch: bool) {
     let (_guard, admin, _, store) = setup().await;
     enable_writes(&admin).await;
@@ -2017,6 +2450,163 @@ async fn mcp_session_journal_reconnects_replays_and_shares_http_outcomes() {
 }
 
 #[tokio::test]
+async fn mcp_session_end_known_rejection_guides_release_without_private_state() {
+    let (_guard, admin, _, store) = setup().await;
+    enable_writes(&admin).await;
+    let server = start(store).await;
+    let client = connect(&server, "one", A).await.unwrap();
+    let claimed = call(
+        &client,
+        "awr_team_command",
+        serde_json::to_value(command(
+            &prepared(&client).await,
+            "session-close-claim",
+            "claim.acquire",
+            json!({"session_id":"session-a","expected_session_version":"1",
+                "expected_work_version":"0","ttl_seconds":60}),
+        ))
+        .unwrap(),
+        false,
+    )
+    .await;
+    let claim = claimed["receipt"]["data"].clone();
+    let rejected_request_id = "session-close-known-rejection";
+    let rejected = call(
+        &client,
+        "awr_team_command",
+        serde_json::to_value(command(
+            &prepared(&client).await,
+            rejected_request_id,
+            "session.end",
+            json!({"session_id":"session-a","expected_session_version":"1"}),
+        ))
+        .unwrap(),
+        true,
+    )
+    .await;
+    assert_session_end_rejection(
+        &rejected,
+        "ACTIVE_CLAIM",
+        "claim.release",
+        &["session-a", claim["claim_id"].as_str().unwrap(), A],
+    );
+    let inspected = call(
+        &client,
+        "awr_team_query",
+        json!({"protocol_version":1,"op":"command.inspect","work_id":"a",
+            "request_id":rejected_request_id}),
+        false,
+    )
+    .await;
+    assert_eq!(inspected["data"]["state"], "unknown");
+    assert_eq!(
+        admin
+            .query_one(
+                "SELECT count(*) FROM awr_team.operations WHERE request_id=$1",
+                &[&rejected_request_id],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+
+    admin.batch_execute("INSERT INTO awr_team.wait_items(tenant_id,project_id,id,session_id,work_id,question,state)
+        VALUES('reader-tenant','reader-project','mcp-private-wait','session-a','a','private wait','open')").await.unwrap();
+    let wait_request_id = "session-close-known-wait";
+    let waiting = call(
+        &client,
+        "awr_team_command",
+        serde_json::to_value(command(
+            &prepared(&client).await,
+            wait_request_id,
+            "session.end",
+            json!({"session_id":"session-a","expected_session_version":"1"}),
+        ))
+        .unwrap(),
+        true,
+    )
+    .await;
+    assert_session_end_rejection(
+        &waiting,
+        "WAIT_OPEN",
+        "Resolve the open wait",
+        &["session-a", "mcp-private-wait", "private wait", A],
+    );
+
+    admin.batch_execute("INSERT INTO awr_team.executions(tenant_id,project_id,id,work_id,session_id,fence,contract_hash,executor_actor_id,state)
+        VALUES('reader-tenant','reader-project','mcp-private-execution','a','session-a',1,'contract','agent','unknown')").await.unwrap();
+    let recovery_request_id = "session-close-known-recovery";
+    let recovering = call(
+        &client,
+        "awr_team_command",
+        serde_json::to_value(command(
+            &prepared(&client).await,
+            recovery_request_id,
+            "session.end",
+            json!({"session_id":"session-a","expected_session_version":"1"}),
+        ))
+        .unwrap(),
+        true,
+    )
+    .await;
+    assert_session_end_rejection(
+        &recovering,
+        "UNRESOLVED_EFFECTS",
+        "work.observe",
+        &["session-a", "mcp-private-execution", "private wait", A],
+    );
+    let rejected_operations = admin
+        .query_one(
+            "SELECT count(*) FROM awr_team.operations WHERE request_id=ANY($1)",
+            &[&&[rejected_request_id, wait_request_id, recovery_request_id][..]],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0);
+    assert_eq!(rejected_operations, 0);
+    admin
+        .batch_execute(
+            "UPDATE awr_team.executions SET state='succeeded' WHERE id='mcp-private-execution';
+        UPDATE awr_team.wait_items SET state='replied' WHERE id='mcp-private-wait'",
+        )
+        .await
+        .unwrap();
+
+    let released = call(
+        &client,
+        "awr_team_command",
+        serde_json::to_value(command(
+            &prepared(&client).await,
+            "session-close-release",
+            "claim.release",
+            json!({"session_id":"session-a","expected_session_version":"1",
+                "claim_id":claim["claim_id"],"expected_fence":claim["fence"],
+                "expected_lease_version":claim["lease_version"]}),
+        ))
+        .unwrap(),
+        false,
+    )
+    .await;
+    assert_eq!(released["receipt"]["data"]["state"], "released");
+    let ended = call(
+        &client,
+        "awr_team_command",
+        serde_json::to_value(command(
+            &prepared(&client).await,
+            "session-close-after-release",
+            "session.end",
+            json!({"session_id":"session-a","expected_session_version":"1"}),
+        ))
+        .unwrap(),
+        false,
+    )
+    .await;
+    assert_eq!(ended["receipt"]["data"]["state"], "ended");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn initialized_clients_recheck_revocation_for_tools_and_discovery() {
     let (_guard, admin, _, store) = setup().await;
     let server = start(store).await;
@@ -2233,4 +2823,387 @@ async fn mcp_envelope_limit_never_returns_a_partial_large_checkpoint() {
     let body = result.text().await.unwrap();
     assert!(body.contains("ResponseTooLarge"));
     assert!(!body.contains("PRIVATE_LARGE_CONTENT"));
+}
+
+async fn assert_command_rejection(
+    server: &Server,
+    client: &Client,
+    input: &Value,
+    status: reqwest::StatusCode,
+    field: Option<&str>,
+    constraint: Option<&str>,
+    hidden: &[&str],
+) {
+    let mcp = call(client, "awr_team_command", input.clone(), true).await;
+    let response = http()
+        .post(format!("{}/one/command", server.url))
+        .bearer_auth(A)
+        .json(input)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), status);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(mcp, body);
+    if let Some(field) = field {
+        assert_eq!(body["invalid_field"], field);
+        assert_eq!(body["constraint"], constraint.unwrap());
+        assert!(
+            body["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("decimal strings")
+        );
+    } else {
+        assert!(body.get("invalid_field").is_none());
+    }
+    let text = body.to_string();
+    for secret in hidden {
+        assert!(!text.contains(secret), "{secret}");
+    }
+    assert!(text.len() < 1024, "{}", text.len());
+}
+
+#[tokio::test]
+async fn execution_start_schema_names_missing_mode_on_http_and_mcp() {
+    let (_guard, admin, _, store) = setup().await;
+    enable_writes(&admin).await;
+    let server = start(store).await;
+    let client = connect(&server, "one", A).await.unwrap();
+    let tools = client.list_all_tools().await.unwrap();
+    let schema = &tools
+        .iter()
+        .find(|tool| tool.name == "awr_team_command")
+        .unwrap()
+        .input_schema;
+    let flat = &schema["properties"]["args"]["properties"];
+    assert_eq!(
+        flat["execution_mode"]["enum"],
+        json!(["caller_managed", "reference_write_v1"])
+    );
+    assert_eq!(
+        flat["expected_input_digest"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        flat["expected_work_version"]["pattern"],
+        "^(0|[1-9][0-9]*)$"
+    );
+    assert_eq!(flat["input_digest"]["type"], json!(["string", "null"]));
+    let start_branch = schema["allOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| branch["if"]["properties"]["op"]["const"] == "execution.start")
+        .unwrap();
+    let start_args = &start_branch["then"]["properties"]["args"];
+    assert_eq!(start_args["additionalProperties"], false);
+    assert!(
+        start_args["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("execution_mode"))
+    );
+    assert!(
+        !start_args["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("expected_input_digest"))
+    );
+
+    let taken = call(
+        &client,
+        "awr_team_command",
+        serde_json::to_value(command(
+            &prepared(&client).await,
+            "start-schema-claim",
+            "claim.acquire",
+            json!({"session_id":"session-a","expected_session_version":"1",
+                "expected_work_version":"0","ttl_seconds":60}),
+        ))
+        .unwrap(),
+        false,
+    )
+    .await;
+    assert_eq!(taken["receipt"]["execution_authorized"], false);
+    let claim = taken["receipt"]["data"].clone();
+    let prepared_for_intent = prepared(&client).await;
+    let intent = call(
+        &client,
+        "awr_team_command",
+        serde_json::to_value(command(
+            &prepared_for_intent,
+            "start-schema-prepare",
+            "execution.prepare",
+            json!({"session_id":"session-a","expected_session_version":"1",
+                "claim_id":claim["claim_id"],"expected_fence":claim["fence"],
+                "expected_lease_version":claim["lease_version"],
+                "expected_work_version":prepared_for_intent["data"]["runtime"]["work_version"],
+                "input_digest":"a".repeat(64),"declared_scope":["src"]}),
+        ))
+        .unwrap(),
+        false,
+    )
+    .await;
+    assert_eq!(intent["receipt"]["execution_authorized"], false);
+    assert_eq!(intent["receipt"]["data"]["dispatched"], false);
+    let execution = intent["receipt"]["data"].clone();
+    let header = prepared(&client).await;
+    let revision = header["project_revision"].clone();
+    let digest = "a".repeat(64);
+    let accepted = json!({
+        "session_id":"session-a",
+        "expected_session_version":"1",
+        "execution_id":execution["execution_id"],
+        "expected_execution_version":execution["execution_version"],
+        "claim_id":claim["claim_id"],
+        "expected_fence":claim["fence"],
+        "expected_lease_version":claim["lease_version"],
+        "expected_work_version":header["data"]["runtime"]["work_version"],
+        "execution_mode":"caller_managed",
+        "expected_input_digest":Value::Null
+    });
+    let request = |id: &str, args: &Value| {
+        serde_json::to_value(command(&header, id, "execution.start", args.clone())).unwrap()
+    };
+    let hidden = [
+        "synthetic-private-mode",
+        "synthetic-secret-key",
+        "synthetic-secret-value",
+        "private-digest-sentinel",
+    ];
+
+    let mut missing_mode = accepted.clone();
+    missing_mode
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_mode");
+    assert_command_rejection(
+        &server,
+        &client,
+        &request("start-missing-mode", &missing_mode),
+        reqwest::StatusCode::BAD_REQUEST,
+        Some("/args/execution_mode"),
+        Some("required"),
+        &hidden,
+    )
+    .await;
+
+    let mut missing_claim = accepted.clone();
+    missing_claim.as_object_mut().unwrap().remove("claim_id");
+    assert_command_rejection(
+        &server,
+        &client,
+        &request("start-missing-claim", &missing_claim),
+        reqwest::StatusCode::BAD_REQUEST,
+        Some("/args/claim_id"),
+        Some("required"),
+        &hidden,
+    )
+    .await;
+
+    let mut unknown = accepted.clone();
+    unknown["synthetic-secret-key"] = json!("synthetic-secret-value");
+    assert_command_rejection(
+        &server,
+        &client,
+        &request("start-unknown-field", &unknown),
+        reqwest::StatusCode::BAD_REQUEST,
+        Some("/args"),
+        Some("unexpected_field"),
+        &hidden,
+    )
+    .await;
+
+    let mut null_execution = accepted.clone();
+    null_execution["execution_id"] = Value::Null;
+    assert_command_rejection(
+        &server,
+        &client,
+        &request("start-null-execution", &null_execution),
+        reqwest::StatusCode::BAD_REQUEST,
+        Some("/args/execution_id"),
+        Some("type"),
+        &hidden,
+    )
+    .await;
+
+    let mut zero_version = accepted.clone();
+    zero_version["expected_work_version"] = json!("0");
+    assert_command_rejection(
+        &server,
+        &client,
+        &request("start-zero-version", &zero_version),
+        reqwest::StatusCode::BAD_REQUEST,
+        Some("/args/expected_work_version"),
+        Some("pattern"),
+        &hidden,
+    )
+    .await;
+
+    let mut bad_type = accepted.clone();
+    bad_type["expected_fence"] = json!(1);
+    assert_command_rejection(
+        &server,
+        &client,
+        &request("start-fence-type", &bad_type),
+        reqwest::StatusCode::BAD_REQUEST,
+        Some("/args/expected_fence"),
+        Some("type"),
+        &hidden,
+    )
+    .await;
+
+    let mut bad_digest = accepted.clone();
+    bad_digest["expected_input_digest"] = json!("private-digest-sentinel");
+    assert_command_rejection(
+        &server,
+        &client,
+        &request("start-bad-digest", &bad_digest),
+        reqwest::StatusCode::BAD_REQUEST,
+        Some("/args/expected_input_digest"),
+        Some("pattern"),
+        &hidden,
+    )
+    .await;
+
+    let mut reference_missing = accepted.clone();
+    reference_missing["execution_mode"] = json!("reference_write_v1");
+    reference_missing
+        .as_object_mut()
+        .unwrap()
+        .remove("expected_input_digest");
+    assert_command_rejection(
+        &server,
+        &client,
+        &request("start-reference-missing-digest", &reference_missing),
+        reqwest::StatusCode::BAD_REQUEST,
+        Some("/args/expected_input_digest"),
+        Some("required"),
+        &hidden,
+    )
+    .await;
+
+    let mut reference_null = accepted.clone();
+    reference_null["execution_mode"] = json!("reference_write_v1");
+    assert_command_rejection(
+        &server,
+        &client,
+        &request("start-reference-null-digest", &reference_null),
+        reqwest::StatusCode::BAD_REQUEST,
+        Some("/args/expected_input_digest"),
+        Some("type"),
+        &hidden,
+    )
+    .await;
+
+    let mut unknown_mode = accepted.clone();
+    unknown_mode["execution_mode"] = json!("synthetic-private-mode");
+    unknown_mode["expected_input_digest"] = json!(digest);
+    assert_command_rejection(
+        &server,
+        &client,
+        &request("start-unknown-mode", &unknown_mode),
+        reqwest::StatusCode::NOT_IMPLEMENTED,
+        None,
+        None,
+        &hidden,
+    )
+    .await;
+    let unknown_body = call(
+        &client,
+        "awr_team_command",
+        request("start-unknown-mode", &unknown_mode),
+        true,
+    )
+    .await;
+    assert_eq!(unknown_body["code"], "Unsupported");
+
+    let mut unattested = accepted.clone();
+    unattested["execution_mode"] = json!("reference_write_v1");
+    unattested["expected_input_digest"] = json!(digest);
+    assert_command_rejection(
+        &server,
+        &client,
+        &request("start-reference-unattested", &unattested),
+        reqwest::StatusCode::FORBIDDEN,
+        None,
+        None,
+        &hidden,
+    )
+    .await;
+
+    let mut mismatched = accepted.clone();
+    mismatched["expected_input_digest"] = json!("b".repeat(64));
+    assert_command_rejection(
+        &server,
+        &client,
+        &request("start-mismatched-digest", &mismatched),
+        reqwest::StatusCode::CONFLICT,
+        None,
+        None,
+        &hidden,
+    )
+    .await;
+    assert_eq!(
+        call(
+            &client,
+            "awr_team_command",
+            request("start-mismatched-digest", &mismatched),
+            true,
+        )
+        .await["code"],
+        "PreconditionsChanged"
+    );
+    assert_eq!(prepared(&client).await["project_revision"], revision);
+
+    let started: Value = http()
+        .post(format!("{}/one/command", server.url))
+        .bearer_auth(A)
+        .json(&request("start-caller-null-digest", &accepted))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(started["execution_authorized"], true);
+    assert_eq!(
+        started["receipt"]["data"]["execution_mode"],
+        "caller_managed"
+    );
+    assert_eq!(started["receipt"]["data"]["input_digest"], digest);
+    assert_eq!(started["receipt"]["data"]["dispatched"], false);
+    assert_eq!(started["receipt"]["data"]["state"], "running");
+    let replay = call(
+        &client,
+        "awr_team_command",
+        request("start-caller-null-digest", &accepted),
+        false,
+    )
+    .await;
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["receipt"], started["receipt"]);
+    assert_eq!(replay["execution_authorized"], false);
+    let inspected = call(
+        &client,
+        "awr_team_query",
+        json!({"protocol_version":1,"op":"execution.inspect","work_id":"a",
+            "execution_id":execution["execution_id"]}),
+        false,
+    )
+    .await;
+    assert_eq!(inspected["data"]["state"], "running");
+    assert_eq!(inspected["data"]["execution_authorized"], false);
+    assert_eq!(
+        admin
+            .query_one("SELECT count(*) FROM awr_team.outbox", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    client.cancel().await.unwrap();
 }
